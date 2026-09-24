@@ -1,0 +1,109 @@
+name: Verify runtime text contract (fork only)
+
+on:
+  push:
+    branches: [verify/runtime-text-20260924]
+    paths: [.github/workflows/verify-runtime-text.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  text-contract:
+    if: github.repository == 'kvnloo/openmuse'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: classic
+            ref: 8c09be01b4114e76ec9fbc5df337e85f5e010b7d
+          - runtime: tanstack
+            ref: bc1ac1dad92b4992ae72285a1855e236b5269486
+    steps:
+      - name: Check out pinned upstream runtime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: CopilotKit/openmuse
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - name: Compose exact PR 51 patch without merging either branch
+        shell: bash
+        env:
+          SUBJECT_SHA: ${{ matrix.ref }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SUBJECT_SHA"
+          git fetch --no-tags --depth=1 origin 8c09be01b4114e76ec9fbc5df337e85f5e010b7d
+          git fetch --no-tags --depth=1 origin refs/pull/51/head
+          test "$(git rev-parse FETCH_HEAD)" = 0d9a8cf755d6c5062ad400bee6913e75cb6598b5
+          git diff 8c09be01b4114e76ec9fbc5df337e85f5e010b7d 0d9a8cf755d6c5062ad400bee6913e75cb6598b5 -- apps/server/src/engine/model.ts tests/model-worker.test.ts > "$RUNNER_TEMP/pr51.patch"
+          test -s "$RUNNER_TEMP/pr51.patch"
+          git apply --check "$RUNNER_TEMP/pr51.patch"
+          git apply "$RUNNER_TEMP/pr51.patch"
+          git diff --stat
+      - name: Set up Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - name: Install exact package manager and locked dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global pnpm@11.19.0
+          test "$(pnpm --version)" = 11.19.0
+          pnpm install --frozen-lockfile
+      - name: Positive control through real runtime and task consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm exec tsx --test tests/model-worker.test.ts tests/demo-model.test.ts tests/conversation-browser.test.ts 2>&1 | tee "$RUNNER_TEMP/green.log"
+      - name: Remove only production fix and require the reported failure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp apps/server/src/engine/model.ts "$RUNNER_TEMP/fixed-model.ts"
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          const path = 'apps/server/src/engine/model.ts';
+          const source = fs.readFileSync(path, 'utf8');
+          const fixed = '(event.type === EventType.TEXT_MESSAGE_CHUNK ||\n            event.type === EventType.TEXT_MESSAGE_CONTENT)';
+          if (source.split(fixed).length !== 2) throw new Error('Expected one exact PR 51 condition');
+          fs.writeFileSync(path, source.replace(fixed, 'event.type === EventType.TEXT_MESSAGE_CONTENT'));
+          JS
+          set +e
+          pnpm exec tsx --test --test-name-pattern='the model worker keeps the text a model replies with when it calls no tool' tests/model-worker.test.ts > "$RUNNER_TEMP/red.log" 2>&1
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/red.log"
+          cp "$RUNNER_TEMP/fixed-model.ts" apps/server/src/engine/model.ts
+          test "$rc" -ne 0
+          grep -q 'ERR_ASSERTION' "$RUNNER_TEMP/red.log"
+          grep -q 'Find cool stuff on Hacker News' "$RUNNER_TEMP/red.log"
+          grep -q '# fail 1' "$RUNNER_TEMP/red.log"
+          echo 'Confirmed: removing only text-event acceptance breaks the real saved-reply regression.'
+      - name: Receipt
+        if: always()
+        shell: bash
+        env:
+          RUNTIME: ${{ matrix.runtime }}
+          SUBJECT_SHA: ${{ matrix.ref }}
+        run: |
+          {
+            echo "## ${RUNTIME} / PR 51 compatibility"
+            echo "Runtime commit: ${SUBJECT_SHA}"
+            echo 'Text fix: 0d9a8cf755d6c5062ad400bee6913e75cb6598b5'
+            echo 'Real runtime and task consumer; local provider fixtures only. No deployment or live provider keys.'
+            for log in green red; do
+              echo "### ${log}"
+              if test -f "$RUNNER_TEMP/$log.log"; then
+                echo '```text'
+                tail -60 "$RUNNER_TEMP/$log.log"
+                echo '```'
+              else
+                echo 'Not reached.'
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
