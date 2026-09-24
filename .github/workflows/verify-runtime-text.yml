@@ -59,12 +59,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pnpm exec tsx --test tests/model-worker.test.ts tests/demo-model.test.ts tests/conversation-browser.test.ts 2>&1 | tee "$RUNNER_TEMP/green.log"
+          # The checks below consume TAP; never depend on Node's default reporter.
+          pnpm exec tsx --test --test-reporter=tap tests/model-worker.test.ts tests/demo-model.test.ts tests/conversation-browser.test.ts 2>&1 | tee "$RUNNER_TEMP/green.log"
+          grep -Fxq 'TAP version 13' "$RUNNER_TEMP/green.log"
+          grep -Fxq '# tests 13' "$RUNNER_TEMP/green.log"
+          grep -Fxq '# pass 13' "$RUNNER_TEMP/green.log"
+          grep -Fxq '# fail 0' "$RUNNER_TEMP/green.log"
+          grep -Fxq '# cancelled 0' "$RUNNER_TEMP/green.log"
+          grep -Fxq '# skipped 0' "$RUNNER_TEMP/green.log"
       - name: Remove only production fix and require the reported failure
         shell: bash
         run: |
           set -euo pipefail
           cp apps/server/src/engine/model.ts "$RUNNER_TEMP/fixed-model.ts"
+          trap 'cp "$RUNNER_TEMP/fixed-model.ts" apps/server/src/engine/model.ts' EXIT
           node --input-type=module <<'JS'
           import fs from 'node:fs';
           const path = 'apps/server/src/engine/model.ts';
@@ -74,15 +82,20 @@ jobs:
           fs.writeFileSync(path, source.replace(fixed, 'event.type === EventType.TEXT_MESSAGE_CONTENT'));
           JS
           set +e
-          pnpm exec tsx --test --test-name-pattern='the model worker keeps the text a model replies with when it calls no tool' tests/model-worker.test.ts > "$RUNNER_TEMP/red.log" 2>&1
+          pnpm exec tsx --test --test-reporter=tap --test-name-pattern='the model worker keeps the text a model replies with when it calls no tool' tests/model-worker.test.ts > "$RUNNER_TEMP/red.log" 2>&1
           rc=$?
           set -e
           cat "$RUNNER_TEMP/red.log"
-          cp "$RUNNER_TEMP/fixed-model.ts" apps/server/src/engine/model.ts
-          test "$rc" -ne 0
-          grep -q 'ERR_ASSERTION' "$RUNNER_TEMP/red.log"
-          grep -q 'Find cool stuff on Hacker News' "$RUNNER_TEMP/red.log"
-          grep -q '# fail 1' "$RUNNER_TEMP/red.log"
+          test "$rc" -eq 1
+          grep -Fxq 'TAP version 13' "$RUNNER_TEMP/red.log"
+          grep -Fxq '# tests 1' "$RUNNER_TEMP/red.log"
+          grep -Fxq '# pass 0' "$RUNNER_TEMP/red.log"
+          grep -Fxq '# fail 1' "$RUNNER_TEMP/red.log"
+          grep -Fxq '# cancelled 0' "$RUNNER_TEMP/red.log"
+          grep -Fxq '# skipped 0' "$RUNNER_TEMP/red.log"
+          grep -Eq '^not ok [0-9]+ - the model worker keeps the text a model replies with when it calls no tool$' "$RUNNER_TEMP/red.log"
+          grep -Fq 'ERR_ASSERTION' "$RUNNER_TEMP/red.log"
+          grep -Fq 'Find cool stuff on Hacker News' "$RUNNER_TEMP/red.log"
           echo 'Confirmed: removing only text-event acceptance breaks the real saved-reply regression.'
       - name: Receipt
         if: always()
