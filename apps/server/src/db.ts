@@ -5,6 +5,15 @@ import pg from "pg";
 import { backgroundFailure } from "./log.ts";
 
 type Row = { data: Record<string, unknown> };
+/** Projected task fields the 1s worker tick filters on (see Store.scanTaskTickCandidates). */
+export interface TaskTickCandidate {
+  owner: string;
+  id: string;
+  status: string;
+  nextRunAt?: string;
+  leaseUntil?: string;
+  actionId?: string;
+}
 interface Database {
   query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }>;
   close: () => Promise<void>;
@@ -74,6 +83,27 @@ export class Store {
       [kind],
     );
     return result.rows.map((row) => row.data as { owner: string; value: T });
+  }
+  /**
+   * 1s worker-tick hot path: only the fields the tick filters on. Task records
+   * accumulate forever (results, evidence, state) and are never pruned, so the
+   * unprojected scan re-reads the whole history every second. Full records are
+   * fetched per eligible task instead.
+   */
+  async scanTaskTickCandidates(): Promise<TaskTickCandidate[]> {
+    const result = await this.db.query(
+      `SELECT owner, id, data->>'status' AS "status", data->>'nextRunAt' AS "nextRunAt",
+              data->>'leaseUntil' AS "leaseUntil", data->>'actionId' AS "actionId"
+       FROM records WHERE kind='tasks' ORDER BY updated_at ASC`,
+    );
+    return (result.rows as unknown as TaskTickCandidate[]).map((row) => ({
+      owner: row.owner,
+      id: row.id,
+      status: row.status,
+      nextRunAt: row.nextRunAt ?? undefined,
+      leaseUntil: row.leaseUntil ?? undefined,
+      actionId: row.actionId ?? undefined,
+    }));
   }
   async claim<T>(owner: string, id: string, status: string, now: string): Promise<T | null> {
     const result = await this.db.query(

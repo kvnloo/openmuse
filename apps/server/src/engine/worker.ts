@@ -72,9 +72,9 @@ export class TaskWorker {
     this.ticking = true;
     this.lastTickAt = new Date(this.now()).toISOString();
     try {
-      const records = await this.db.scan<AgentTask>("tasks");
-      const due = records.filter(
-        ({ value: t }) =>
+      const candidates = await this.db.scanTaskTickCandidates();
+      const due = candidates.filter(
+        (t) =>
           !this.active.has(t.id) &&
           (t.status === "queued" ||
             (t.status === "scheduled" && Date.parse(t.nextRunAt ?? "") <= this.now()) ||
@@ -82,30 +82,34 @@ export class TaskWorker {
             t.status === "waiting_approval"),
       );
       const eligible = [];
-      for (const record of due) {
-        if (record.value.status === "waiting_approval") {
-          const action = record.value.actionId
+      for (const candidate of due) {
+        // Fetch the full record only for tasks that pass the filter; this is also
+        // fresher than the scan snapshot, so the lease-claim CAS below races less.
+        const value = await this.db.get<AgentTask>(candidate.owner, "tasks", candidate.id);
+        if (!value) continue;
+        if (value.status === "waiting_approval") {
+          const action = value.actionId
             ? await this.db.get<{ status: string; expiresAt?: string }>(
-                record.owner,
+                candidate.owner,
                 "actions",
-                record.value.actionId,
+                value.actionId,
               )
             : null;
           if (
-            record.value.actionId &&
+            value.actionId &&
             action?.status === "awaiting_review" &&
             Date.parse(action.expiresAt ?? "") <= this.now()
           )
             await this.db.compareAndSwap(
-              record.owner,
+              candidate.owner,
               "actions",
-              record.value.actionId,
+              value.actionId,
               { status: "awaiting_review", expiresAt: action.expiresAt },
               { status: "expired" },
             );
           else if (action && ["awaiting_review", "executing"].includes(action.status)) continue;
         }
-        eligible.push(record);
+        eligible.push({ owner: candidate.owner, value });
         if (eligible.length === 3) break;
       }
       await Promise.all(eligible.map(({ owner, value }) => this.run(owner, value)));
