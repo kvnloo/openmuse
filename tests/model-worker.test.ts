@@ -7,6 +7,7 @@ import { createApp } from "../apps/server/src/app.ts";
 import { createStore } from "../apps/server/src/db.ts";
 import { createDemoModel, demoModel } from "../apps/server/src/demo/model.ts";
 import type { ActionProposal } from "../packages/domain/src/index.ts";
+import { browserFixture } from "./helpers/browser.ts";
 import { fixture as computerFixture } from "./helpers/computer.ts";
 import { modelFixture } from "./helpers/model.ts";
 
@@ -163,4 +164,54 @@ test("the model worker keeps the text a model replies with when it calls no tool
     await db.close();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("cancelling a task during read_web sends no page read and returns the task to queued", async (t) => {
+  const calls: string[] = [];
+  let abortTask: (() => void) | undefined;
+  const browser = await browserFixture(t, (path, body) => {
+    calls.push(path);
+    if (path === "/sessions") {
+      // Cancel the delegated task while its browser read is in flight.
+      abortTask?.();
+      return {
+        data: {
+          id: String(body.id),
+          title: "Source",
+          url: String(body.url),
+          status: "active",
+          updatedAt: new Date().toISOString(),
+        },
+      };
+    }
+    throw new Error(`Unexpected browser path: ${path}`);
+  });
+  const modelCalls: { name: string; arguments: object }[] = [
+    { name: "read_web", arguments: { url: "https://example.com/article" } },
+  ];
+  await modelFixture(t, (index) => modelCalls[index]);
+  const app = await createApp(browser.db, {
+    ...browser.config,
+    agentBackend: "model",
+    model: "openai/fixture",
+  });
+  t.after(() => app.agent.stop());
+  const task = await app.agent.createTask("owner", {
+    prompt: "Read this public article and summarize it.",
+  });
+  abortTask = () => app.agent.worker.abort(task.id);
+  await app.agent.worker.tick();
+  // Without the signal, the observation keeps running in the background after
+  // the abort and sends the page read anyway; give it a chance to prove it.
+  const deadline = Date.now() + 2000;
+  while (calls.length === 1 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.deepEqual(
+    calls,
+    ["/sessions"],
+    "cancellation must stop the observation before the page read is sent",
+  );
+  const saved = await app.agent.getTask("owner", task.id);
+  assert.equal(saved.status, "queued", "a cancelled task re-queues instead of failing");
 });
