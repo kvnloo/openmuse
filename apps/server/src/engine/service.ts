@@ -34,6 +34,7 @@ import { backgroundFailure } from "../log.ts";
 import type { WorkspaceService } from "../workspace.ts";
 import { analyzeSpending } from "./finance.ts";
 import { executeModelTask } from "./model.ts";
+import { dedupeMonitorText } from "./monitor-text.ts";
 import { LostLeaseError, type TaskContext, TaskWorker } from "./worker.ts";
 
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -1009,17 +1010,26 @@ export class AgentService {
         typeof task.state.sessionId === "string" ? task.state.sessionId : undefined,
       );
     }
-    const text = observation.text.replace(/\s+/g, " ").trim();
-    const currentHash = hash(text);
     const previousHash =
       typeof task.state.lastHash === "string" ? task.state.lastHash : monitor.lastHash;
-    const matched =
-      monitor.condition === "change"
+    const previouslyMatched = Boolean(task.state.matched);
+    const prepared = dedupeMonitorText(
+      observation.text,
+      typeof task.state.lastRawHash === "string" &&
+        typeof previousHash === "string" &&
+        typeof monitor.lastValue === "string"
+        ? { rawHash: task.state.lastRawHash, hash: previousHash, prefix: monitor.lastValue }
+        : undefined,
+    );
+    const text = prepared.text;
+    const currentHash = prepared.hash;
+    const matched = prepared.reused
+      ? previouslyMatched
+      : monitor.condition === "change"
         ? Boolean(previousHash && previousHash !== currentHash)
         : monitor.condition === "contains"
           ? text.toLowerCase().includes(monitor.value.toLowerCase())
           : this.matchesPrice(text, Number(monitor.value));
-    const previouslyMatched = Boolean(task.state.matched);
     const shouldNotify = matched && (monitor.condition === "change" || !previouslyMatched);
     const nextCheckAt = new Date(Date.now() + monitor.intervalMinutes * 60000).toISOString();
     await ctx.guard();
@@ -1033,6 +1043,7 @@ export class AgentService {
         checks: monitor.checks + 1,
         lastCheckedAt: date(),
         lastHash: currentHash,
+        lastRawHash: prepared.rawHash,
         lastValue: text.slice(0, 1000),
         nextCheckAt,
         error: null,
@@ -1058,6 +1069,7 @@ export class AgentService {
         ...task.state,
         sessionId: observation.sessionId,
         lastHash: currentHash,
+        lastRawHash: prepared.rawHash,
         resumingMonitor: false,
         matched,
         failures: 0,
