@@ -39,6 +39,23 @@ import { LostLeaseError, type TaskContext, TaskWorker } from "./worker.ts";
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 const date = () => new Date().toISOString();
 const terminal = new Set(["succeeded", "failed", "cancelled"]);
+// The notification dedupe key publishOutcome() notifies with for a task's current
+// state, if it notifies at all. Mirrors the branch conditions in publishOutcome:
+// when the key for the current state is already recorded on the task, the outcome
+// was published and the maintenance loop can skip the row.
+const outcomeKey = (task: AgentTask): string | undefined => {
+  if (task.status === "succeeded") return `task-done:${task.id}`;
+  if (task.status === "failed") return `task-error:${task.id}:${task.attempts}`;
+  if (task.status === "waiting_input") return `input:${task.id}:${hash(task.question ?? "")}`;
+  if (task.status === "waiting_approval") return `review:${task.actionId}`;
+  if (task.status === "cancelled") return `cancelled:${task.id}`;
+  const notice = z
+    .object({ title: z.string(), body: z.string(), key: z.string() })
+    .safeParse(task.state.notice);
+  if ((task.status === "scheduled" || (task.status === "paused" && task.error)) && notice.success)
+    return notice.data.key;
+  return undefined;
+};
 export class AgentService {
   readonly worker: TaskWorker;
   private maintenance?: ReturnType<typeof setInterval>;
@@ -75,8 +92,14 @@ export class AgentService {
     this.refreshing = true;
     try {
       // Recover publications if the process exited after committing an outcome.
-      for (const { owner, value } of await this.db.scan<AgentTask>("tasks"))
+      for (const { owner, value } of await this.db.scan<AgentTask>("tasks")) {
+        // Skip rows whose outcome notification is already durably recorded: without
+        // this the loop re-reads and re-publishes every settled row on every pass,
+        // so steady-state cost grows with lifetime row count instead of active rows.
+        const key = outcomeKey(value);
+        if (key && value.state.publishedOutcome === key) continue;
         await this.publishOutcome(owner, value);
+      }
       for (const { owner, value } of await this.db.scan<Monitor>("monitors"))
         await this.activateMonitor(owner, value);
       for (const { owner, value } of await this.db.scan<Idea>("ideas"))
@@ -890,6 +913,21 @@ export class AgentService {
         { status: "active", error: task.error },
         { status: "paused" },
       );
+    const key = outcomeKey(task);
+    if (key) {
+      // Record that this outcome's notification was published so the maintenance
+      // loop can skip the row on later passes. A crash between notify() and this
+      // write is safe: notify() dedupes on the same key via insertIfAbsent, so the
+      // recovery pass just repeats an idempotent write. The status guard keeps a
+      // concurrent retry (which changes the outcome key) from being masked.
+      await this.db.compareAndSwap(
+        owner,
+        "tasks",
+        task.id,
+        { status: task.status },
+        { state: { ...task.state, publishedOutcome: key } },
+      );
+    }
   }
   private async document(
     owner: string,
