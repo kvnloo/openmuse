@@ -107,15 +107,10 @@ export async function executeModelTask(
       "Read the authorized workspace sources",
       z.object({ section: z.enum(["mail", "calendar", "files", "all"]) }),
       async ({ section }) => {
-        const w = await service.workspace.snapshot(owner);
-        return {
-          mail: section === "mail" || section === "all" ? w.mail : undefined,
-          events: section === "calendar" || section === "all" ? w.events : undefined,
-          files:
-            section === "files" || section === "all"
-              ? w.files.map(({ url, ...file }) => file)
-              : undefined,
-        };
+        // Section-scoped read: the tool only returns mail, events, and
+        // files, so it never pulls the full workspace (browsers, actions,
+        // activity) or whichever sections the caller omitted.
+        return service.workspace.sectionSnapshot(owner, section);
       },
     ),
     tool(
