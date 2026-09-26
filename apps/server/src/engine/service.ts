@@ -752,9 +752,12 @@ export class AgentService {
     // A decision can land after the run prepared its review but before the
     // outcome commits: reconcile a waiting_approval outcome against the linked
     // review's current row, or the task would park on a dead review (and notify
-    // "Ready for your review" for it) until the next tick fails it.
-    if (outcome.status === "waiting_approval" && outcome.actionId) {
-      const action = await this.db.get<ActionProposal>(owner, "actions", outcome.actionId);
+    // "Ready for your review" for it) until the next tick fails it. The model
+    // path carries the review id on the outcome; the tick-poll short-circuit
+    // returns waiting_approval without one, so fall back to the task's link.
+    const reviewId = outcome.actionId ?? task.actionId;
+    if (outcome.status === "waiting_approval" && reviewId) {
+      const action = await this.db.get<ActionProposal>(owner, "actions", reviewId);
       if (!action) throw new Error("The linked review could not be found");
       if (action.status === "denied")
         return {

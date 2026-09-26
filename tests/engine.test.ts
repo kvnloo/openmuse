@@ -727,3 +727,95 @@ test("a run that prepared its review with no decision still parks in waiting_app
     await db.close();
   }
 });
+test("a deny landing while a recovered run re-polls its review fails instead of re-parking", async () => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      execute: async () => "sent",
+      connected: async () => true,
+    });
+    const agent = new AgentService(db, {} as never, {} as never, {} as never, actions, {} as never);
+    const owner = "poll-deny-owner";
+    const proposal = await actions.propose(owner, {
+      kind: "email.send" as const,
+      data: { to: ["sam@example.com"], subject: "Visit", body: "See attached." },
+    });
+    // A worker died mid-model-run after prepare() checkpointed the review
+    // link: the task is running with a stale lease and a live review.
+    await db.put(owner, "tasks", {
+      ...task("task1"),
+      status: "running",
+      leaseId: "stale-lease",
+      leaseUntil: new Date(Date.now() - 1000).toISOString(),
+      actionId: proposal.id,
+    });
+    // Flip the review between execute()'s entry read and the outcome
+    // reconcile: models a deny landing while the recovered run re-polls. The
+    // short-circuit returns waiting_approval with no actionId on the outcome,
+    // so the reconcile must fall back to the task's link.
+    const realGet = db.get.bind(db);
+    let entryRead = false;
+    db.get = (async <T>(o: string, kind: string, id: string): Promise<T | null> => {
+      if (o === owner && kind === "actions" && id === proposal.id) {
+        if (!entryRead) {
+          entryRead = true;
+          return realGet<T>(o, kind, id);
+        }
+        const row = await realGet<ActionProposal>(o, kind, id);
+        if (row) await db.put(o, kind, { ...row, status: "denied" });
+        return realGet<T>(o, kind, id);
+      }
+      return realGet<T>(o, kind, id);
+    }) as typeof db.get;
+    await agent.worker.tick();
+    const saved = await db.get<AgentTask>(owner, "tasks", "task1");
+    assert.equal(saved?.status, "failed");
+    assert.match(saved?.error ?? "", /Reviewed action denied/);
+    // The dead link stays on the failed task so retry can clear it.
+    assert.equal(saved?.actionId, proposal.id);
+  } finally {
+    await db.close();
+  }
+});
+test("an expiry landing while a recovered run re-polls its review re-queues instead of re-parking", async () => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      execute: async () => "sent",
+      connected: async () => true,
+    });
+    const agent = new AgentService(db, {} as never, {} as never, {} as never, actions, {} as never);
+    const owner = "poll-expiry-owner";
+    const proposal = await actions.propose(owner, {
+      kind: "email.send" as const,
+      data: { to: ["sam@example.com"], subject: "Visit", body: "See attached." },
+    });
+    await db.put(owner, "tasks", {
+      ...task("task1"),
+      status: "running",
+      leaseId: "stale-lease",
+      leaseUntil: new Date(Date.now() - 1000).toISOString(),
+      actionId: proposal.id,
+    });
+    const realGet = db.get.bind(db);
+    let entryRead = false;
+    db.get = (async <T>(o: string, kind: string, id: string): Promise<T | null> => {
+      if (o === owner && kind === "actions" && id === proposal.id) {
+        if (!entryRead) {
+          entryRead = true;
+          return realGet<T>(o, kind, id);
+        }
+        const row = await realGet<ActionProposal>(o, kind, id);
+        if (row) await db.put(o, kind, { ...row, status: "expired" });
+        return realGet<T>(o, kind, id);
+      }
+      return realGet<T>(o, kind, id);
+    }) as typeof db.get;
+    await agent.worker.tick();
+    const saved = await db.get<AgentTask>(owner, "tasks", "task1");
+    assert.equal(saved?.status, "queued");
+    assert.equal(saved?.actionId, null);
+  } finally {
+    await db.close();
+  }
+});
