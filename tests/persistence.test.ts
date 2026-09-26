@@ -31,3 +31,51 @@ test("idle Postgres client errors are logged instead of crashing the process", a
     await pool.end();
   }
 });
+
+test("listByTaskId returns only the task's rows in list() order", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "postgres") });
+    try {
+      await db.put("owner", "agent-artifacts", { id: "a1", taskId: "t1", title: "one" });
+      await db.put("owner", "agent-artifacts", { id: "a2", taskId: "t2", title: "two" });
+      await db.put("owner", "agent-artifacts", { id: "a3", taskId: "t1", title: "three" });
+      await db.put("owner", "agent-artifacts", { id: "a4", title: "no-task" });
+      const scoped = await db.listByTaskId<{ id: string }>("owner", "agent-artifacts", "t1");
+      const full = await db.list<{ id: string }>("owner", "agent-artifacts");
+      assert.deepEqual(
+        scoped.map((r) => r.id),
+        full.filter((r) => ["a1", "a3"].includes(r.id)).map((r) => r.id),
+      );
+      assert.deepEqual(scoped.map((r) => r.id).sort(), ["a1", "a3"]);
+    } finally {
+      await db.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("listByIds returns the requested ids in list() order, empty for none", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openmuse-db-"));
+  try {
+    const db = await createStore({ dataDir: join(root, "postgres") });
+    try {
+      await db.put("owner", "files", { id: "f1", name: "one" });
+      await db.put("owner", "files", { id: "f2", name: "two" });
+      await db.put("owner", "files", { id: "f3", name: "three" });
+      const some = await db.listByIds<{ id: string }>("owner", "files", ["f3", "f1"]);
+      const full = await db.list<{ id: string }>("owner", "files");
+      assert.deepEqual(
+        some.map((r) => r.id),
+        full.filter((r) => ["f1", "f3"].includes(r.id)).map((r) => r.id),
+      );
+      assert.deepEqual(await db.listByIds("owner", "files", []), []);
+      assert.deepEqual(await db.listByIds("owner", "files", ["missing"]), []);
+    } finally {
+      await db.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

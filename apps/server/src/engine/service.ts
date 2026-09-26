@@ -159,22 +159,21 @@ export class AgentService {
   }
   async detail(owner: string, id: string) {
     const task = await this.getTask(owner, id);
-    const files = (await this.db.list<Artifact>(owner, "files")).filter((file) =>
-      task.artifactIds.includes(file.id),
+    const browserIds = [task.state.browserId, task.state.sessionId].filter(
+      (value): value is string => value !== undefined && value !== null,
     );
-    const browsers = (await this.db.list<BrowserSession>(owner, "browsers")).filter((browser) =>
-      [task.state.browserId, task.state.sessionId].includes(browser.id),
+    const files = await this.db.listByIds<Artifact>(owner, "files", task.artifactIds);
+    const browsers = await this.db.listByIds<BrowserSession>(owner, "browsers", browserIds);
+    const events = (await this.db.listByTaskId<RunEvent>(owner, "run-events", id)).sort((a, b) =>
+      a.date.localeCompare(b.date),
     );
+    const artifacts = await this.db.listByTaskId<AgentArtifact>(owner, "agent-artifacts", id);
     return {
       task,
       files: files.map((file) => this.files.signed(owner, file)),
       browsers: browsers.map((browser) => this.browser.decorate(owner, browser)),
-      events: (await this.db.list<RunEvent>(owner, "run-events"))
-        .filter((e) => e.taskId === id)
-        .sort((a, b) => a.date.localeCompare(b.date)),
-      artifacts: (await this.db.list<AgentArtifact>(owner, "agent-artifacts")).filter(
-        (a) => a.taskId === id,
-      ),
+      events,
+      artifacts,
     };
   }
   async createTask(owner: string, raw: unknown, idempotencyKey?: string, held = false) {
