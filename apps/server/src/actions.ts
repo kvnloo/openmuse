@@ -109,7 +109,12 @@ export class ActionService {
     if (!proposal) throw new AppError("Action not found", 404);
     if (proposal.hash !== hash)
       throw new AppError("This proposal changed. Open its latest review before deciding.", 409);
-    if (proposal.status !== "awaiting_review") return proposal;
+    if (proposal.status !== "awaiting_review") {
+      // The fresh read already shows the recorded outcome: a conflicting
+      // decision is rejected, an idempotent repeat returns the row as-is.
+      this.rejectLostDecision(proposal, decision);
+      return proposal;
+    }
     if (decision === "approve" && proposal.taskId) {
       const task = await this.db.get<{ status: string }>(owner, "tasks", proposal.taskId);
       if (!task || !["running", "waiting_approval"].includes(task.status))
@@ -129,6 +134,9 @@ export class ActionService {
       if (!expired) {
         const current = await this.db.get<ActionProposal>(owner, "actions", id);
         if (!current) throw new AppError("Action not found", 404);
+        // The tick's identical CAS (or a concurrent decision) won the race.
+        // A lost decision is never reported as a success.
+        this.rejectLostDecision(current, decision);
         return current;
       }
       throw new AppError("This review expired. Create a fresh proposal.", 409);
@@ -156,6 +164,18 @@ export class ActionService {
     if (!claimed) {
       const current = await this.db.get<ActionProposal>(owner, "actions", id);
       if (!current) throw new AppError("Action not found", 404);
+      // The atomic claim refused: a concurrent decision, the tick's expiry,
+      // or (for approve) a task that left running/waiting_approval. None of
+      // these may be reported as a successful decision.
+      this.rejectLostDecision(current, decision);
+      if (decision === "approve" && current.status === "awaiting_review" && proposal.taskId) {
+        const task = await this.db.get<{ status: string }>(owner, "tasks", proposal.taskId);
+        if (!task || !["running", "waiting_approval"].includes(task.status))
+          throw new AppError(
+            "Resume the task before approving this action. Cancelled tasks cannot execute.",
+            409,
+          );
+      }
       return current;
     }
     await this.record(
@@ -188,6 +208,20 @@ export class ActionService {
     await this.db.put(owner, "actions", finished);
     await this.record(owner, finished, finished.result ?? finished.error ?? finished.status);
     return finished;
+  }
+  /**
+   * A decision whose atomic claim (or expiry CAS) lost to a concurrent
+   * decision, the tick's expiry flip, or a time-expired row must never be
+   * reported as a success. Conflicting decisions get a 409; only an
+   * idempotent repeat of the recorded outcome returns the row as-is.
+   */
+  private rejectLostDecision(current: ActionProposal, decision: "approve" | "deny"): void {
+    if (current.status === "expired" || Date.parse(current.expiresAt) <= this.now())
+      throw new AppError("This review expired. Create a fresh proposal.", 409);
+    if (decision === "deny" && current.status === "executing")
+      throw new AppError("This review was already approved; the action is executing.", 409);
+    if (decision === "approve" && current.status === "denied")
+      throw new AppError("This review was already denied.", 409);
   }
   private async record(owner: string, action: ActionProposal, detail: string) {
     await this.db.put(owner, "activity", {

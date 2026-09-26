@@ -285,3 +285,150 @@ test("an expired stale review cannot overwrite a concurrently executing action",
   await approval;
   assert.equal(saved?.status, "executing");
 });
+
+test("a deny that loses the claim to a concurrent approve is rejected, not silently dropped", async () => {
+  const gate = deferred<void>();
+  const service = new ActionService(db, {
+    connected: async () => true,
+    execute: async () => {
+      await gate.promise;
+      return "sent";
+    },
+  });
+  const proposal = await service.propose("conflict-user", email);
+  const approval = service.decide("conflict-user", proposal.id, proposal.hash, "approve");
+  for (let i = 0; i < 200; i++) {
+    const snap = await db.get<ActionProposal>("conflict-user", "actions", proposal.id);
+    if (snap?.status === "executing") break;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  await assert.rejects(
+    service.decide("conflict-user", proposal.id, proposal.hash, "deny"),
+    /already approved/i,
+  );
+  const during = await db.get<ActionProposal>("conflict-user", "actions", proposal.id);
+  assert.equal(during?.status, "executing");
+  gate.resolve();
+  assert.equal((await approval).status, "succeeded");
+});
+
+test("an approve that loses the claim to a concurrent deny is rejected, not silently dropped", async () => {
+  const service = new ActionService(db, {
+    connected: async () => true,
+    execute: async () => "sent",
+  });
+  const proposal = await service.propose("conflict-user-2", email);
+  assert.equal(
+    (await service.decide("conflict-user-2", proposal.id, proposal.hash, "deny")).status,
+    "denied",
+  );
+  await assert.rejects(
+    service.decide("conflict-user-2", proposal.id, proposal.hash, "approve"),
+    /already denied/i,
+  );
+  const saved = await db.get<ActionProposal>("conflict-user-2", "actions", proposal.id);
+  assert.equal(saved?.status, "denied");
+});
+
+test("repeating the recorded decision stays idempotent", async () => {
+  let calls = 0;
+  const service = new ActionService(db, {
+    connected: async () => true,
+    execute: async () => {
+      calls++;
+      return "sent";
+    },
+  });
+  const denied = await service.propose("idem-user-1", email);
+  assert.equal(
+    (await service.decide("idem-user-1", denied.id, denied.hash, "deny")).status,
+    "denied",
+  );
+  assert.equal(
+    (await service.decide("idem-user-1", denied.id, denied.hash, "deny")).status,
+    "denied",
+  );
+  const approved = await service.propose("idem-user-2", email);
+  assert.equal(
+    (await service.decide("idem-user-2", approved.id, approved.hash, "approve")).status,
+    "succeeded",
+  );
+  assert.equal(
+    (await service.decide("idem-user-2", approved.id, approved.hash, "approve")).status,
+    "succeeded",
+  );
+  assert.equal(calls, 1);
+});
+
+test("an approval crossing the expiry line mid-request is rejected, not silently dropped", async () => {
+  const t0 = Date.now();
+  let expired = false;
+  const service = new ActionService(db, {
+    // The connected() check runs immediately before the claim SQL, so arming
+    // the clock here simulates the review expiring between decide()'s
+    // pre-checks and the atomic claim.
+    connected: async () => {
+      expired = true;
+      return true;
+    },
+    now: () => (expired ? t0 + 31 * 60 * 1000 : t0),
+    execute: async () => "sent",
+  });
+  const proposal = await service.propose("midflight-expiry", email);
+  await assert.rejects(
+    service.decide("midflight-expiry", proposal.id, proposal.hash, "approve"),
+    /expired/i,
+  );
+  const saved = await db.get<ActionProposal>("midflight-expiry", "actions", proposal.id);
+  assert.equal(saved?.status, "awaiting_review");
+});
+
+test("a decision whose own expiry CAS loses to the tick is rejected", async (t) => {
+  let now = Date.now();
+  const service = new ActionService(db, {
+    connected: async () => true,
+    now: () => now,
+    execute: async () => "sent",
+  });
+  const proposal = await service.propose("cas-race", email);
+  now += 31 * 60 * 1000;
+  // The tick flips the row between decide()'s read and its expiry CAS.
+  const originalCAS = db.compareAndSwap.bind(db);
+  let flipped = false;
+  t.mock.method(db, "compareAndSwap", async (...args: Parameters<Store["compareAndSwap"]>) => {
+    if (!flipped && args[1] === "actions") {
+      flipped = true;
+      await db.put("cas-race", "actions", { ...proposal, status: "expired" });
+    }
+    return originalCAS(...args);
+  });
+  await assert.rejects(
+    service.decide("cas-race", proposal.id, proposal.hash, "approve"),
+    /expired/i,
+  );
+});
+
+test("an approval whose claim loses to a task pause is rejected with the resume hint", async (t) => {
+  const service = new ActionService(db, {
+    connected: async () => true,
+    execute: async () => "sent",
+  });
+  await db.put("pause-user", "tasks", { id: "task-pause-1", status: "running" });
+  const proposal = await service.propose("pause-user", email, undefined, "task-pause-1");
+  // The pause lands between decide()'s task pre-check and the claim SQL.
+  const originalClaim = db.claim.bind(db);
+  let paused = false;
+  t.mock.method(db, "claim", async (...args: Parameters<Store["claim"]>) => {
+    if (!paused) {
+      paused = true;
+      await db.put("pause-user", "tasks", { id: "task-pause-1", status: "paused" });
+    }
+    return originalClaim(...args);
+  });
+  await assert.rejects(
+    service.decide("pause-user", proposal.id, proposal.hash, "approve"),
+    /Resume the task before approving/i,
+  );
+  const saved = await db.get<ActionProposal>("pause-user", "actions", proposal.id);
+  assert.equal(saved?.status, "awaiting_review");
+});

@@ -3,10 +3,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { ActionService } from "../apps/server/src/actions.ts";
 import { createStore } from "../apps/server/src/db.ts";
 import { analyzeSpending } from "../apps/server/src/engine/finance.ts";
+import { AgentService } from "../apps/server/src/engine/service.ts";
 import { TaskWorker } from "../apps/server/src/engine/worker.ts";
+import { AppError } from "../apps/server/src/errors.ts";
 import type { AgentTask } from "../packages/domain/src/agent.ts";
+import type { ActionProposal } from "../packages/domain/src/index.ts";
 
 function task(id = "task1"): AgentTask {
   return {
@@ -207,6 +211,79 @@ test("a failed run record does not leave the task stuck in the worker", async ()
     ]);
     assert.equal(stopped, true);
     assert.equal((await db.get<AgentTask>("owner", "tasks", "task1"))?.status, "failed");
+  } finally {
+    await db.close();
+  }
+});
+test("cancelling a task still succeeds when its cleanup deny loses to a concurrent decision", async (t) => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      connected: async () => true,
+      now: () => Date.now(),
+      execute: async () => "sent",
+    });
+    const service = new AgentService(
+      db,
+      {} as never,
+      {} as never,
+      {} as never,
+      actions,
+      {} as never,
+    );
+    const proposal = await actions.propose("owner", {
+      kind: "email.send",
+      data: { to: ["reviewer@example.com"], subject: "Review", body: "Approve?" },
+    });
+    await db.put("owner", "tasks", {
+      ...task(),
+      status: "waiting_approval",
+      actionId: proposal.id,
+    });
+    // A concurrent decision (or expiry) wins the cleanup claim after the
+    // awaiting_review read: the cleanup deny throws 409.
+    t.mock.method(actions, "decide", async () => {
+      throw new AppError("This review expired. Create a fresh proposal.", 409);
+    });
+    const cancelled = await service.control("owner", "task1", "cancel");
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(
+      (await db.get<ActionProposal>("owner", "actions", proposal.id))?.status,
+      "awaiting_review",
+    );
+  } finally {
+    await db.close();
+  }
+});
+test("cancelling a task still surfaces a non-conflict cleanup failure", async (t) => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      connected: async () => true,
+      now: () => Date.now(),
+      execute: async () => "sent",
+    });
+    const service = new AgentService(
+      db,
+      {} as never,
+      {} as never,
+      {} as never,
+      actions,
+      {} as never,
+    );
+    const proposal = await actions.propose("owner", {
+      kind: "email.send",
+      data: { to: ["reviewer@example.com"], subject: "Review", body: "Approve?" },
+    });
+    await db.put("owner", "tasks", {
+      ...task(),
+      status: "waiting_approval",
+      actionId: proposal.id,
+    });
+    t.mock.method(actions, "decide", async () => {
+      throw new AppError("database unavailable", 500);
+    });
+    await assert.rejects(service.control("owner", "task1", "cancel"), /database unavailable/);
   } finally {
     await db.close();
   }

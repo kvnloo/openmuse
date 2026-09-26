@@ -127,9 +127,12 @@ test("ideas ignore sent replies while retaining unfinished incoming requests", a
 test("cancelling a task denies its pending action", async () => {
   const { task, action } = await documentTask();
   await server.agent.control(owner, task.id, "cancel");
-  assert.equal(
-    (await server.actions.decide(owner, action.id, action.hash, "approve")).status,
-    "denied",
+  assert.equal((await db.get<ActionProposal>(owner, "actions", action.id))?.status, "denied");
+  // A later approval of the cancelled review is a conflicting decision and is
+  // rejected rather than reported as a success.
+  await assert.rejects(
+    server.actions.decide(owner, action.id, action.hash, "approve"),
+    /already denied/i,
   );
   await server.agent.worker.tick();
   assert.equal((await server.agent.getTask(owner, task.id)).status, "cancelled");

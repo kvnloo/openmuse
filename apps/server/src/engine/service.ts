@@ -293,7 +293,13 @@ export class AgentService {
     if (action === "cancel" && task.actionId) {
       const proposal = await this.db.get<ActionProposal>(owner, "actions", task.actionId);
       if (proposal?.status === "awaiting_review")
-        await this.actions.decide(owner, proposal.id, proposal.hash, "deny");
+        // Best-effort cleanup: a concurrent decision (or expiry) winning the
+        // claim must not fail the cancel itself.
+        try {
+          await this.actions.decide(owner, proposal.id, proposal.hash, "deny");
+        } catch (error) {
+          if (!(error instanceof AppError) || error.status !== 409) throw error;
+        }
     }
     await this.db.put(owner, "run-events", {
       id: randomUUID(),
@@ -709,7 +715,13 @@ export class AgentService {
       await context.checkpoint({ actionId: proposal.id });
     } catch (error) {
       if (proposal.status === "awaiting_review")
-        await this.actions.decide(owner, proposal.id, proposal.hash, "deny");
+        // Best-effort cleanup: a concurrent decision (or expiry) winning the
+        // claim must not mask the original checkpoint failure.
+        try {
+          await this.actions.decide(owner, proposal.id, proposal.hash, "deny");
+        } catch (denyError) {
+          if (!(denyError instanceof AppError) || denyError.status !== 409) throw denyError;
+        }
       throw error;
     }
     await context.event(
