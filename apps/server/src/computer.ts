@@ -634,13 +634,38 @@ export class ComputerService {
           active.token !== lease.token ||
           active.stopping ||
           active.expiresAt <= Date.now()
-        )
-          return this.db.put(owner, "computer-commands", {
+        ) {
+          // A concurrent Stop may have already quarantined this row; its
+          // record already carries the interruption and must not be
+          // overwritten by a blind put.
+          const stopped: ComputerCommand = {
             ...command,
             status: "interrupted",
             stderr: "Stopped before execution",
             completedAt: new Date().toISOString(),
-          });
+          };
+          const saved = await this.db.compareAndSwap<ComputerCommand>(
+            owner,
+            "computer-commands",
+            id,
+            { status: "running" },
+            {
+              status: "interrupted",
+              stderr: stopped.stderr,
+              completedAt: stopped.completedAt,
+            },
+          );
+          return (
+            saved ?? (await this.db.get<ComputerCommand>(owner, "computer-commands", id)) ?? stopped
+          );
+        }
+        // The lease check above won its race, but a Stop quarantine or a
+        // lease-expiry recovery may still have marked this command dead after
+        // the row was written. Never execute a command the system already
+        // declared interrupted: it would run to completion yet report
+        // "interrupted", inviting a duplicate retry of its side effects.
+        const receipt = await this.db.get<ComputerCommand>(owner, "computer-commands", id);
+        if (receipt && receipt.status !== "running") return receipt;
         let result: DockerResult;
         try {
           result = await this.docker(
