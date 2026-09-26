@@ -193,7 +193,15 @@ export class TaskWorker {
         checkpoint,
         event,
       });
-      await checkpoint({ ...result, leaseId: null, leaseUntil: null });
+      // The model consumed task.state.answer when the run started; clear it now
+      // so a stale answer cannot leak into a later round's prompt. Abort paths
+      // below never reach here, so an undelivered answer is preserved.
+      await checkpoint({
+        ...result,
+        state: { ...task.state, ...result.state, answer: null },
+        leaseId: null,
+        leaseUntil: null,
+      });
       await this.db.put(owner, "runs", {
         id: leaseId,
         taskId,
