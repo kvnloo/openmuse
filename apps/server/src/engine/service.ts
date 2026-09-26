@@ -283,7 +283,15 @@ export class AgentService {
               ? "Paused. Resume when you're ready."
               : "",
         ...(task.kind === "monitor" && action === "resume"
-          ? { state: { ...task.state, failures: 0, notice: null, resumingMonitor: false } }
+          ? {
+              state: {
+                ...task.state,
+                failures: 0,
+                notice: null,
+                noticeCycle: Number(task.state.noticeCycle ?? 0) + 1,
+                resumingMonitor: false,
+              },
+            }
           : {}),
       },
     );
@@ -430,7 +438,13 @@ export class AgentService {
           leaseId: null,
           leaseUntil: null,
           error: null,
-          state: { ...task.state, resumingMonitor: false, failures: 0, notice: null },
+          state: {
+            ...task.state,
+            resumingMonitor: false,
+            failures: 0,
+            notice: null,
+            noticeCycle: Number(task.state.noticeCycle ?? 0) + 1,
+          },
         },
       );
     if (!task.state.initializingMonitor) return null;
@@ -529,7 +543,12 @@ export class AgentService {
           leaseId: null,
           leaseUntil: null,
           error: null,
-          state: { ...task.state, failures: 0, notice: null },
+          state: {
+            ...task.state,
+            failures: 0,
+            notice: null,
+            noticeCycle: Number(task.state.noticeCycle ?? 0) + 1,
+          },
         },
       );
       if (queued) return saved;
@@ -815,6 +834,11 @@ export class AgentService {
         const nextCheckAt = new Date(
           Date.now() + Math.min(60, 2 ** failures) * 60000,
         ).toISOString();
+        // The notification key carries the notice cycle so a resume (which
+        // resets the failure counter) starts a fresh notification identity:
+        // without it the next cycle's alerts are swallowed by insertIfAbsent
+        // against the previous cycle's rows.
+        const noticeCycle = Number(task.state.noticeCycle ?? 0);
         await this.db.compareAndSwap(
           owner,
           "monitors",
@@ -838,7 +862,7 @@ export class AgentService {
             notice: {
               title: "Watch needs attention",
               body: detail,
-              key: `watch-error:${task.id}:${failures >= 5 ? "paused" : "retry"}`,
+              key: `watch-error:${task.id}:${noticeCycle}:${failures >= 5 ? "paused" : "retry"}`,
             },
           },
         };

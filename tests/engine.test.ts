@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,7 +10,7 @@ import { analyzeSpending } from "../apps/server/src/engine/finance.ts";
 import { AgentService } from "../apps/server/src/engine/service.ts";
 import { TaskWorker } from "../apps/server/src/engine/worker.ts";
 import { AppError } from "../apps/server/src/errors.ts";
-import type { AgentTask } from "../packages/domain/src/agent.ts";
+import type { AgentNotification, AgentTask, Monitor } from "../packages/domain/src/agent.ts";
 import type { ActionProposal } from "../packages/domain/src/index.ts";
 
 function task(id = "task1"): AgentTask {
@@ -815,6 +816,74 @@ test("an expiry landing while a recovered run re-polls its review re-queues inst
     const saved = await db.get<AgentTask>(owner, "tasks", "task1");
     assert.equal(saved?.status, "queued");
     assert.equal(saved?.actionId, null);
+  } finally {
+    await db.close();
+  }
+});
+test("a resumed watch's next failure notifies instead of being swallowed by the old cycle's key", async () => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      execute: async () => "sent",
+      connected: async () => true,
+    });
+    const browser = {
+      observe: async () => {
+        throw new Error("Page unavailable");
+      },
+    };
+    const agent = new AgentService(
+      db,
+      {} as never,
+      {} as never,
+      {} as never,
+      actions,
+      browser as never,
+    );
+    const owner = "watch-renotify-owner";
+    const keyId = (key: string) => createHash("sha256").update(key).digest("hex");
+    await db.put<Monitor>(owner, "monitors", {
+      id: "m1",
+      taskId: "task1",
+      title: "Dinner watch",
+      url: "https://example.com/availability",
+      condition: "change",
+      value: "",
+      intervalMinutes: 1,
+      status: "paused",
+      nextCheckAt: new Date().toISOString(),
+      checks: 0,
+    });
+    // The previous cycle already sent its retry-phase alert (pre-fix key scheme).
+    await db.put<AgentNotification>(owner, "notifications", {
+      id: keyId("watch-error:task1:retry"),
+      taskId: "task1",
+      title: "Watch needs attention",
+      body: "Page unavailable",
+      createdAt: new Date().toISOString(),
+      read: true,
+    });
+    await db.put(owner, "tasks", {
+      ...task("task1"),
+      kind: "monitor",
+      status: "paused",
+      error: "Page unavailable",
+      input: { monitorId: "m1" },
+      state: { failures: 5, notice: null },
+    });
+    await agent.control(owner, "task1", "resume");
+    await agent.worker.tick();
+    const saved = await db.get<AgentTask>(owner, "tasks", "task1");
+    assert.equal(saved?.status, "scheduled");
+    assert.equal(saved?.state.failures, 1);
+    // The new cycle's alert must be a fresh notification row, not deduped
+    // against the previous cycle's retry key.
+    const notes = await db.list<AgentNotification>(owner, "notifications");
+    assert.ok(
+      notes.some((n) => n.id === keyId("watch-error:task1:1:retry")),
+      "expected a fresh cycle-1 retry notification",
+    );
+    assert.equal(notes.filter((n) => n.taskId === "task1").length, 2);
   } finally {
     await db.close();
   }
