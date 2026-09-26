@@ -211,3 +211,38 @@ test("a failed run record does not leave the task stuck in the worker", async ()
     await db.close();
   }
 });
+test("a consumed answer is cleared from task state when the run commits", async () => {
+  const db = await createStore();
+  try {
+    const waiting = task("task1");
+    waiting.status = "waiting_input";
+    waiting.question = "Old question";
+    waiting.state = { answer: "stale answer" };
+    await db.put("owner", "tasks", waiting);
+    // Mirror service.answer(): re-queue, clear the question, keep the answer.
+    await db.compareAndSwap(
+      "owner",
+      "tasks",
+      "task1",
+      { status: "waiting_input" },
+      { status: "queued", question: null },
+    );
+    let seenAnswer: unknown;
+    const handle = async (_owner: string, value: AgentTask) => {
+      seenAnswer = value.state.answer;
+      return { status: "waiting_input" as const, question: "New question" };
+    };
+    await new TaskWorker(db, handle).tick();
+    assert.equal(seenAnswer, "stale answer", "the run must still receive the answer");
+    const saved = await db.get<AgentTask>("owner", "tasks", "task1");
+    assert.equal(saved?.status, "waiting_input");
+    assert.equal(saved?.question, "New question");
+    assert.equal(
+      saved?.state.answer,
+      null,
+      "the consumed answer must not leak into the next round",
+    );
+  } finally {
+    await db.close();
+  }
+});
