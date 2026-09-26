@@ -28,6 +28,15 @@ interface Options {
   connection?: (owner: string) => Promise<{ id: string; account: string } | null>;
   now?: () => number;
 }
+// A denied or expired proposal in the idempotent slot is a dead review: the
+// worker's checkpoint-failure cleanup may have denied it, or it expired while
+// the task was paused. Other terminal states (succeeded/failed/outcome_unknown)
+// are receipts that idempotent replay must preserve.
+const deadReviewStatuses = new Set(["denied", "expired"]);
+function isDeadReview(proposal: ActionProposal, now: number): boolean {
+  if (deadReviewStatuses.has(proposal.status)) return true;
+  return proposal.status === "awaiting_review" && Date.parse(proposal.expiresAt) <= now;
+}
 export class ActionService {
   private readonly now: () => number;
   constructor(
@@ -42,13 +51,18 @@ export class ActionService {
     idempotencyKey?: string,
     taskId?: string,
   ): Promise<ActionProposal> {
-    const id =
+    const slot =
       idempotencyKey === undefined
-        ? randomUUID()
+        ? null
         : createHash("sha256").update(idempotencyKey).digest("hex");
-    if (idempotencyKey !== undefined) {
-      const existing = await this.db.get<ActionProposal>(owner, "actions", id);
-      if (existing) return existing;
+    // A dead review occupying the idempotent slot must not be returned: a
+    // resumed task would fail with a "Reviewed action denied/expired" the user
+    // never saw. Mint a fresh id so the task gets a new review instead.
+    let id = slot ?? randomUUID();
+    if (slot) {
+      const existing = await this.db.get<ActionProposal>(owner, "actions", slot);
+      if (existing && !isDeadReview(existing, this.now())) return existing;
+      if (existing) id = randomUUID();
     }
     const parsed = proposalSchema.parse(raw);
     const connection = await this.options.connection?.(owner);
@@ -88,9 +102,9 @@ export class ActionService {
       expiresAt: new Date(this.now() + 30 * 60 * 1000).toISOString(),
     };
     const saved =
-      idempotencyKey === undefined
-        ? await this.db.put(owner, "actions", proposal)
-        : await this.db.insertIfAbsent(owner, "actions", proposal);
+      id === slot
+        ? await this.db.insertIfAbsent(owner, "actions", proposal)
+        : await this.db.put(owner, "actions", proposal);
     if (!saved) {
       const existing = await this.db.get<ActionProposal>(owner, "actions", id);
       if (!existing) throw new AppError("Prepared action could not be loaded", 409);

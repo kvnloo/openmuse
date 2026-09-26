@@ -211,3 +211,69 @@ test("a failed run record does not leave the task stuck in the worker", async ()
     await db.close();
   }
 });
+test("a task paused during review prep gets a fresh review on resume, not the cleanup-denied one", async () => {
+  const { ActionService } = await import("../apps/server/src/actions.ts");
+  const { AgentService } = await import("../apps/server/src/engine/service.ts");
+  const { LostLeaseError } = await import("../apps/server/src/engine/worker.ts");
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      execute: async () => "sent",
+      prepare: async (_owner, input) => ({ input }),
+      connected: async () => true,
+      connection: async () => ({ id: "conn-1", account: "sam@example.com" }),
+    });
+    const agent = new AgentService(
+      db,
+      { mode: "sample" } as never,
+      { connection: async () => ({ id: "conn-1", account: "sam@example.com" }) } as never,
+      {} as never,
+      actions,
+      {} as never,
+    );
+    const owner = "prepare-owner";
+    const docTask = { ...task("task1"), state: { connectionId: "conn-1" } };
+    const input = {
+      kind: "email.send" as const,
+      data: {
+        to: ["sam@example.com"],
+        cc: [],
+        bcc: [],
+        subject: "Visit",
+        body: "See attached.",
+        attachmentIds: [],
+      },
+    };
+    const lostLease = {
+      signal: new AbortController().signal,
+      guard: async () => {},
+      checkpoint: async (): Promise<never> => {
+        throw new LostLeaseError();
+      },
+      event: async () => {},
+    };
+    // A pause lands between propose() and the actionId checkpoint: prepare()
+    // denies the orphaned proposal as cleanup and rethrows.
+    await assert.rejects(
+      agent.prepare(owner, docTask, input, "document-reply", lostLease as never),
+      LostLeaseError,
+    );
+    const orphaned = await db.list<{ id: string; status: string }>(owner, "actions");
+    assert.equal(orphaned.length, 1);
+    assert.equal(orphaned[0].status, "denied");
+    // On resume the task re-prepares with the same idempotency key. The dead
+    // review must not be returned: the task would fail with a "Reviewed action
+    // denied" the user never issued.
+    const resumed = {
+      signal: new AbortController().signal,
+      guard: async () => {},
+      checkpoint: async (patch: Record<string, unknown>) => ({ ...docTask, ...patch }),
+      event: async () => {},
+    };
+    const fresh = await agent.prepare(owner, docTask, input, "document-reply", resumed as never);
+    assert.equal(fresh.status, "awaiting_review");
+    assert.notEqual(fresh.id, orphaned[0].id);
+  } finally {
+    await db.close();
+  }
+});

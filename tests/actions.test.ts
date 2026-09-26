@@ -285,3 +285,33 @@ test("an expired stale review cannot overwrite a concurrently executing action",
   await approval;
   assert.equal(saved?.status, "executing");
 });
+test("a re-proposal after the slot review was denied starts a fresh review", async () => {
+  const service = new ActionService(db, {
+    execute: async () => "sent",
+    prepare: async (_owner, input) => ({ input }),
+    connected: async () => true,
+    connection: async () => ({ id: "conn", account: "sam@example.com" }),
+  });
+  const first = await service.propose("dead-slot", email, "slot-key", "task-1");
+  assert.equal(first.status, "awaiting_review");
+  await service.decide("dead-slot", first.id, first.hash, "deny");
+  const second = await service.propose("dead-slot", email, "slot-key", "task-1");
+  assert.equal(second.status, "awaiting_review");
+  assert.notEqual(second.id, first.id);
+});
+test("a re-proposal after the slot review expired starts a fresh review", async () => {
+  let now = Date.now();
+  const service = new ActionService(db, {
+    execute: async () => "sent",
+    prepare: async (_owner, input) => ({ input }),
+    connected: async () => true,
+    connection: async () => ({ id: "conn", account: "sam@example.com" }),
+    now: () => now,
+  });
+  const first = await service.propose("stale-slot", email, "slot-key", "task-1");
+  assert.equal(first.status, "awaiting_review");
+  now += 31 * 60 * 1000;
+  const second = await service.propose("stale-slot", email, "slot-key", "task-1");
+  assert.equal(second.status, "awaiting_review");
+  assert.notEqual(second.id, first.id);
+});
