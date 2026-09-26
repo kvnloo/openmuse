@@ -156,6 +156,18 @@ export class ActionService {
     if (!claimed) {
       const current = await this.db.get<ActionProposal>(owner, "actions", id);
       if (!current) throw new AppError("Action not found", 404);
+      // The claim's SQL also refuses an approve whose linked task stopped
+      // being runnable after the pre-check above (e.g. a pause landed in
+      // between). Returning the still-awaiting_review proposal would answer
+      // 200 for an approval that never happened, so surface the same 409.
+      if (decision === "approve" && current.status === "awaiting_review" && current.taskId) {
+        const task = await this.db.get<{ status: string }>(owner, "tasks", current.taskId);
+        if (!task || !["running", "waiting_approval"].includes(task.status))
+          throw new AppError(
+            "Resume the task before approving this action. Cancelled tasks cannot execute.",
+            409,
+          );
+      }
       return current;
     }
     await this.record(

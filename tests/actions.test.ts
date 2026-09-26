@@ -285,3 +285,35 @@ test("an expired stale review cannot overwrite a concurrently executing action",
   await approval;
   assert.equal(saved?.status, "executing");
 });
+
+test("an approve that loses the claim to a pause fails instead of returning the pending proposal", async () => {
+  const service = new ActionService(db, {
+    execute: async () => "sent",
+    connected: async () => true,
+  });
+  await db.put("race-user", "tasks", { id: "task-race-1", status: "running" });
+  const proposal = await service.propose("race-user", email, "race-key-1", "task-race-1");
+  // Pin the race: decide()'s pre-check sees a running task, then a pause
+  // lands before the claim's SQL runs, so the claim is refused while the
+  // proposal is still awaiting_review.
+  const originalGet = db.get.bind(db);
+  let paused = false;
+  db.get = (async (o: string, kind: string, id: string) => {
+    const value = await originalGet(o, kind, id);
+    if (!paused && o === "race-user" && kind === "tasks" && id === "task-race-1") {
+      paused = true;
+      await db.put("race-user", "tasks", { id: "task-race-1", status: "paused" });
+    }
+    return value;
+  }) as Store["get"];
+  try {
+    await assert.rejects(
+      service.decide("race-user", proposal.id, proposal.hash, "approve"),
+      /Resume the task before approving/,
+    );
+  } finally {
+    db.get = originalGet;
+  }
+  const saved = await db.get("race-user", "actions", proposal.id);
+  assert.equal(saved?.status, "awaiting_review");
+});
