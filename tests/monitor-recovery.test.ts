@@ -191,7 +191,7 @@ test("the paused alert is delivered when the final failure outcome is lost", asy
   assert.equal(task?.status, "paused");
   assert.equal((await db.get<Monitor>(owner, "monitors", monitor.id))?.status, "paused");
   const pausedId = createHash("sha256")
-    .update(`watch-error:${monitor.taskId}:paused`)
+    .update(`watch-error:${monitor.taskId}:1:paused`)
     .digest("hex");
   const paused = (await read<AgentNotification[]>("/notifications")).filter(
     (item) => item.id === pausedId,
@@ -207,6 +207,50 @@ test("the paused alert is delivered when the final failure outcome is lost", asy
   await server.agent.worker.tick();
   assert.equal((await db.get<AgentTask>(owner, "tasks", monitor.taskId))?.status, "scheduled");
   assert.equal((await db.get<Monitor>(owner, "monitors", monitor.id))?.status, "active");
+});
+
+test("a watch that recovers and fails again notifies for the new failure streak", async () => {
+  await read("/sample-page", { text: "No tables available" });
+  const monitor = await createMonitor("Flaky availability");
+  await server.agent.worker.tick();
+  const notificationId = (streak: number) =>
+    createHash("sha256").update(`watch-error:${monitor.taskId}:${streak}:retry`).digest("hex");
+  const notified = async (streak: number) =>
+    (await read<AgentNotification[]>("/notifications")).some(
+      (item) => item.id === notificationId(streak),
+    );
+
+  // First failure streak notifies.
+  const restorePage = failPage();
+  try {
+    await makeDue(monitor.taskId);
+    await server.agent.worker.tick();
+    assert.equal((await db.get<AgentTask>(owner, "tasks", monitor.taskId))?.state.failures, 1);
+    await maintain();
+    assert.ok(await notified(1), "the first failure streak should notify");
+  } finally {
+    restorePage();
+  }
+
+  // The watch recovers, resetting the failure count.
+  await makeDue(monitor.taskId);
+  await server.agent.worker.tick();
+  assert.equal((await db.get<AgentTask>(owner, "tasks", monitor.taskId))?.state.failures, 0);
+
+  // A later failure is a new streak and must notify again, not dedup forever.
+  const restorePage2 = failPage();
+  try {
+    await makeDue(monitor.taskId);
+    await server.agent.worker.tick();
+    assert.equal((await db.get<AgentTask>(owner, "tasks", monitor.taskId))?.state.failures, 1);
+    await maintain();
+    assert.ok(await notified(2), "the second failure streak should notify again");
+  } finally {
+    restorePage2();
+  }
+
+  // Leave no active watch behind for later tests.
+  await read(`/monitors/${monitor.id}/control`, { action: "stop" });
 });
 
 test("maintenance finishes a resume that stopped after the monitor was activated", async () => {
