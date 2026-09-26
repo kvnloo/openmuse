@@ -164,6 +164,25 @@ export class ActionService {
       decision === "deny" ? "Declined; no changes made" : "Approved; execution started",
     );
     if (decision === "deny") return claimed;
+    if (claimed.taskId) {
+      // The claim fences the task atomically, but the task can be cancelled before the
+      // provider call below. Re-check after the claim so a cancelled task never executes
+      // its approved side effect; restore the review so it can be approved after resume.
+      const task = await this.db.get<{ status: string }>(owner, "tasks", claimed.taskId);
+      if (!task || !["running", "waiting_approval"].includes(task.status)) {
+        await this.db.compareAndSwap<ActionProposal>(
+          owner,
+          "actions",
+          id,
+          { status: "executing" },
+          { status: "awaiting_review" },
+        );
+        throw new AppError(
+          "Resume the task before approving this action. Cancelled tasks cannot execute.",
+          409,
+        );
+      }
+    }
     let finished: ActionProposal;
     try {
       const input = proposalSchema.parse({ kind: claimed.kind, data: claimed.data });
