@@ -679,7 +679,10 @@ export class AgentService {
     key: string = kind,
   ) {
     const value: AgentArtifact = {
-      id: hash(`${task.id}:${key}`),
+      // Identity is (task, kind, key): two artifacts of different kinds must
+      // never share a row, even when the caller reuses the same key text
+      // (e.g. save_artifact keyed by title).
+      id: hash(`${task.id}:${kind}:${key}`),
       taskId: task.id,
       kind,
       title,

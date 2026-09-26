@@ -3,8 +3,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { ActionService } from "../apps/server/src/actions.ts";
 import { createStore } from "../apps/server/src/db.ts";
 import { analyzeSpending } from "../apps/server/src/engine/finance.ts";
+import { AgentService } from "../apps/server/src/engine/service.ts";
 import { TaskWorker } from "../apps/server/src/engine/worker.ts";
 import type { AgentTask } from "../packages/domain/src/agent.ts";
 
@@ -207,6 +209,61 @@ test("a failed run record does not leave the task stuck in the worker", async ()
     ]);
     assert.equal(stopped, true);
     assert.equal((await db.get<AgentTask>("owner", "tasks", "task1"))?.status, "failed");
+  } finally {
+    await db.close();
+  }
+});
+test("save_artifact idempotency keys are scoped by kind as well as title", async () => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      connected: async () => true,
+      now: () => Date.now(),
+      execute: async () => "sent",
+    });
+    const service = new AgentService(
+      db,
+      {} as never,
+      {} as never,
+      {} as never,
+      actions,
+      {} as never,
+    );
+    const t = task();
+    await db.put("owner", "tasks", t);
+    // Mirror the save_artifact call site: it passed args.title as the key, so a
+    // plan and a report sharing a title minted the same id and the second put
+    // silently overwrote the first.
+    const plan = await service.artifact(
+      "owner",
+      t,
+      "plan",
+      "Trip",
+      "plan summary",
+      { a: 1 },
+      "Trip",
+    );
+    const report = await service.artifact(
+      "owner",
+      t,
+      "report",
+      "Trip",
+      "report summary",
+      { b: 2 },
+      "Trip",
+    );
+    assert.notEqual(plan.id, report.id);
+    const rows = await db.list("owner", "agent-artifacts");
+    assert.equal(rows.length, 2);
+    assert.deepEqual(rows.map((r) => (r as { kind: string }).kind).sort(), ["plan", "report"]);
+    // Same kind+key stays idempotent: retry overwrites, no duplicate row.
+    await service.artifact("owner", t, "plan", "Trip", "plan summary v2", { a: 1 }, "Trip");
+    assert.equal((await db.list("owner", "agent-artifacts")).length, 2);
+    assert.equal(
+      ((await db.get("owner", "agent-artifacts", plan.id)) as { summary: string } | undefined)
+        ?.summary,
+      "plan summary v2",
+    );
   } finally {
     await db.close();
   }
