@@ -781,7 +781,10 @@ export class AgentService {
             notice: {
               title: "Watch needs attention",
               body: detail,
-              key: `watch-error:${task.id}:${failures >= 5 ? "paused" : "retry"}`,
+              // The detail varies per failure while insertIfAbsent dedups on the key,
+              // so the key must carry the detail: otherwise the first retry's error
+              // text wins and later failures with different errors never surface.
+              key: `watch-error:${task.id}:${failures >= 5 ? "paused" : "retry"}:${hash(detail)}`,
             },
           },
         };

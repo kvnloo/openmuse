@@ -191,7 +191,9 @@ test("the paused alert is delivered when the final failure outcome is lost", asy
   assert.equal(task?.status, "paused");
   assert.equal((await db.get<Monitor>(owner, "monitors", monitor.id))?.status, "paused");
   const pausedId = createHash("sha256")
-    .update(`watch-error:${monitor.taskId}:paused`)
+    .update(
+      `watch-error:${monitor.taskId}:paused:${createHash("sha256").update("Page unavailable").digest("hex")}`,
+    )
     .digest("hex");
   const paused = (await read<AgentNotification[]>("/notifications")).filter(
     (item) => item.id === pausedId,
@@ -207,6 +209,58 @@ test("the paused alert is delivered when the final failure outcome is lost", asy
   await server.agent.worker.tick();
   assert.equal((await db.get<AgentTask>(owner, "tasks", monitor.taskId))?.status, "scheduled");
   assert.equal((await db.get<Monitor>(owner, "monitors", monitor.id))?.status, "active");
+});
+
+test("a watch failure with a new error detail notifies again instead of reusing the stale alert", async () => {
+  await read("/sample-page", { text: "No tables available" });
+  const monitor = await createMonitor("Flaky availability");
+  const notifications = async () =>
+    (await read<AgentNotification[]>("/notifications")).filter(
+      (item) => item.taskId === monitor.taskId,
+    );
+  await server.agent.worker.tick();
+  assert.equal((await db.get<AgentTask>(owner, "tasks", monitor.taskId))?.status, "scheduled");
+
+  // Fail twice with different error details.
+  const originalGet = db.get.bind(db);
+  const messages = ["first outage", "second outage"];
+  let calls = 0;
+  db.get = (async (o: string, kind: string, id: string) => {
+    if (kind === "sample-pages" && calls < messages.length) throw new Error(messages[calls++]);
+    return originalGet(o, kind, id);
+  }) as Store["get"];
+  try {
+    await makeDue(monitor.taskId);
+    await server.agent.worker.tick();
+    await makeDue(monitor.taskId);
+    await server.agent.worker.tick();
+  } finally {
+    db.get = originalGet;
+  }
+
+  const found = await notifications();
+  assert.equal(found.length, 2, "each distinct watch error detail should notify once");
+  assert.ok(
+    found.some((item) => item.body === "first outage"),
+    "the first error detail should be kept",
+  );
+  assert.ok(
+    found.some((item) => item.body === "second outage"),
+    "the second, different error detail should notify instead of being swallowed",
+  );
+
+  // An identical repeat still dedups: fail again with the second detail.
+  db.get = (async (o: string, kind: string, id: string) => {
+    if (kind === "sample-pages") throw new Error("second outage");
+    return originalGet(o, kind, id);
+  }) as Store["get"];
+  try {
+    await makeDue(monitor.taskId);
+    await server.agent.worker.tick();
+  } finally {
+    db.get = originalGet;
+  }
+  assert.equal((await notifications()).length, 2, "an identical repeat should still dedup");
 });
 
 test("maintenance finishes a resume that stopped after the monitor was activated", async () => {
