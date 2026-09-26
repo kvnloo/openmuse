@@ -31,3 +31,68 @@ test("idle Postgres client errors are logged instead of crashing the process", a
     await pool.end();
   }
 });
+
+test("listByStatus matches list()+filter semantics", async () => {
+  const db = await createStore();
+  try {
+    await db.put("owner", "computer-commands", {
+      id: "a",
+      status: "running",
+      startedAt: "2026-01-01T00:00:00Z",
+    });
+    await db.put("owner", "computer-commands", {
+      id: "b",
+      status: "succeeded",
+      startedAt: "2026-01-02T00:00:00Z",
+    });
+    await db.put("owner", "computer-commands", { id: "c", startedAt: "2026-01-03T00:00:00Z" }); // no status
+    await db.put("other", "computer-commands", {
+      id: "d",
+      status: "running",
+      startedAt: "2026-01-04T00:00:00Z",
+    });
+    const expected = (
+      (await db.list<{ id: string; status?: string }>("owner", "computer-commands")) as {
+        id: string;
+        status?: string;
+      }[]
+    ).filter((c) => c.status === "running");
+    const scoped = await db.listByStatus("owner", "computer-commands", "running");
+    assert.deepEqual(
+      scoped.map((c: { id: string }) => c.id),
+      expected.map((c) => c.id),
+    );
+  } finally {
+    await db.close();
+  }
+});
+
+test("listRecent matches list()+sort+slice semantics", async () => {
+  const db = await createStore();
+  try {
+    const mk = (id: string, startedAt: string) => ({ id, status: "succeeded", startedAt });
+    await db.put("owner", "computer-commands", mk("a", "2026-01-03T00:00:00Z"));
+    await db.put("owner", "computer-commands", mk("b", "2026-01-01T00:00:00Z"));
+    await db.put("owner", "computer-commands", mk("c", "2026-01-02T00:00:00Z"));
+    await db.put("owner", "computer-commands", mk("d", "2026-01-02T00:00:00Z")); // tie on startedAt
+    await db.put("other", "computer-commands", mk("e", "2026-01-05T00:00:00Z"));
+    const all = (await db.list<{ id: string; startedAt: string }>(
+      "owner",
+      "computer-commands",
+    )) as {
+      id: string;
+      startedAt: string;
+    }[];
+    const expected = all
+      .sort((x, y) => y.startedAt.localeCompare(x.startedAt))
+      .slice(0, 2)
+      .map((c) => c.id);
+    const scoped = await db.listRecent("owner", "computer-commands", "startedAt", 2);
+    assert.deepEqual(
+      scoped.map((c: { id: string }) => c.id),
+      expected,
+    );
+  } finally {
+    await db.close();
+  }
+});

@@ -385,27 +385,33 @@ export class ComputerService {
     );
   }
   private async commands(owner: string) {
-    const commands = await this.db.list<ComputerCommand>(owner, "computer-commands");
     const lease = await this.db.get<Lease>(owner, "computer-state", "lease");
     if (!lease || lease.expiresAt <= Date.now()) {
-      for (const command of commands)
-        if (command.status === "running") {
-          const saved = await this.db.compareAndSwap<ComputerCommand>(
-            owner,
-            "computer-commands",
-            command.id,
-            { status: "running" },
-            {
-              status: "interrupted",
-              completedAt: new Date().toISOString(),
-              stderr:
-                "Execution was interrupted. Its outcome is unknown; inspect files before running it again.",
-            },
-          );
-          if (saved) Object.assign(command, saved);
-        }
+      // The recovery pass only touches running commands, so it reads just
+      // those instead of the whole table; the follow-up read picks up the
+      // committed interrupted statuses, exactly like the old mutate-in-place.
+      const running = await this.db.listByStatus<ComputerCommand>(
+        owner,
+        "computer-commands",
+        "running",
+      );
+      for (const command of running) {
+        const saved = await this.db.compareAndSwap<ComputerCommand>(
+          owner,
+          "computer-commands",
+          command.id,
+          { status: "running" },
+          {
+            status: "interrupted",
+            completedAt: new Date().toISOString(),
+            stderr:
+              "Execution was interrupted. Its outcome is unknown; inspect files before running it again.",
+          },
+        );
+        if (saved) Object.assign(command, saved);
+      }
     }
-    return commands.sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 100);
+    return this.db.listRecent<ComputerCommand>(owner, "computer-commands", "startedAt", 100);
   }
   async snapshot(owner: string): Promise<ComputerSnapshot> {
     const base = {

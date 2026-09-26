@@ -30,6 +30,36 @@ export class Store {
     );
     return result.rows.map((row) => row.data as T);
   }
+  async listByStatus<T = Record<string, unknown>>(
+    owner: string,
+    kind: string,
+    status: string,
+  ): Promise<T[]> {
+    // Pushes a status equality filter into SQL so callers that immediately
+    // filter list() by status don't transfer the whole table. Same ordering
+    // as list(); records missing a status never match, exactly like the
+    // old `x.status === status` JS filter.
+    const result = await this.db.query(
+      "SELECT data FROM records WHERE owner=$1 AND kind=$2 AND data->>'status'=$3 ORDER BY updated_at DESC,id",
+      [owner, kind, status],
+    );
+    return result.rows.map((row) => row.data as T);
+  }
+  async listRecent<T = Record<string, unknown>>(
+    owner: string,
+    kind: string,
+    key: string,
+    limit: number,
+  ): Promise<T[]> {
+    // Newest-N rows by a date key, in SQL. Same ordering as
+    // `list().sort((a, b) => b[key].localeCompare(a[key])).slice(0, limit)`:
+    // DESC on the key with list()'s ordering as the tiebreak.
+    const result = await this.db.query(
+      "SELECT data FROM records WHERE owner=$1 AND kind=$2 ORDER BY data->>$3 DESC,updated_at DESC,id LIMIT $4",
+      [owner, kind, key, limit],
+    );
+    return result.rows.map((row) => row.data as T);
+  }
   async put<T extends { id: string }>(owner: string, kind: string, value: T): Promise<T> {
     await this.db.query(
       "INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb) ON CONFLICT(owner,kind,id) DO UPDATE SET data=excluded.data,updated_at=now()",
