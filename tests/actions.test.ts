@@ -432,3 +432,129 @@ test("an approval whose claim loses to a task pause is rejected with the resume 
   const saved = await db.get<ActionProposal>("pause-user", "actions", proposal.id);
   assert.equal(saved?.status, "awaiting_review");
 });
+
+test("approving a superseded task-linked proposal is rejected, never executed", async () => {
+  let calls = 0;
+  const service = new ActionService(db, {
+    execute: async () => {
+      calls++;
+      return "sent";
+    },
+    connected: async () => true,
+  });
+  const owner = "supersede-user";
+  // The model prepared twice; only the second proposal is linked via task.actionId.
+  const stale = await service.propose(owner, email, "task-1:draft-a", "task-1");
+  const current = await service.propose(owner, email, "task-1:draft-b", "task-1");
+  await db.put(owner, "tasks", { id: "task-1", status: "waiting_approval", actionId: current.id });
+  await assert.rejects(
+    service.decide(owner, stale.id, stale.hash, "approve"),
+    /no longer the task's current proposal/i,
+  );
+  assert.equal(calls, 0);
+  const saved = await db.get<ActionProposal>(owner, "actions", stale.id);
+  assert.equal(saved?.status, "awaiting_review");
+});
+
+test("approving the task's currently linked proposal still executes", async () => {
+  let calls = 0;
+  const service = new ActionService(db, {
+    execute: async () => {
+      calls++;
+      return "sent";
+    },
+    connected: async () => true,
+  });
+  const owner = "linked-user";
+  const stale = await service.propose(owner, email, "task-2:draft-a", "task-2");
+  const current = await service.propose(owner, email, "task-2:draft-b", "task-2");
+  await db.put(owner, "tasks", { id: "task-2", status: "waiting_approval", actionId: current.id });
+  const result = await service.decide(owner, current.id, current.hash, "approve");
+  assert.equal(result.status, "succeeded");
+  assert.equal(calls, 1);
+  const staleSaved = await db.get<ActionProposal>(owner, "actions", stale.id);
+  assert.equal(staleSaved?.status, "awaiting_review");
+});
+
+test("denying a superseded task-linked proposal stays harmless", async () => {
+  const service = new ActionService(db, {
+    execute: async () => "sent",
+    connected: async () => true,
+  });
+  const owner = "deny-supersede-user";
+  const stale = await service.propose(owner, email, "task-3:draft-a", "task-3");
+  const current = await service.propose(owner, email, "task-3:draft-b", "task-3");
+  await db.put(owner, "tasks", { id: "task-3", status: "waiting_approval", actionId: current.id });
+  const result = await service.decide(owner, stale.id, stale.hash, "deny");
+  assert.equal(result.status, "denied");
+  const currentSaved = await db.get<ActionProposal>(owner, "actions", current.id);
+  assert.equal(currentSaved?.status, "awaiting_review");
+});
+
+test("claim() atomically refuses an approve the task no longer links", async () => {
+  const owner = "claim-fence-user";
+  await db.put(owner, "actions", {
+    id: "orphan-1",
+    status: "awaiting_review",
+    taskId: "task-fence",
+    expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+  });
+  await db.put(owner, "tasks", {
+    id: "task-fence",
+    status: "waiting_approval",
+    actionId: "current-1",
+  });
+  const claimed = await db.claim(owner, "orphan-1", "executing", new Date().toISOString());
+  assert.equal(claimed, null);
+  const denied = await db.claim<{ status: string }>(owner, "orphan-1", "denied", new Date().toISOString());
+  assert.equal(denied?.status, "denied");
+});
+
+test("a task re-linked mid-decision reports 409, not success", async () => {
+  const owner = "relink-user";
+  const realDb = await createStore();
+  try {
+    // The first task read (decide's pre-check) still sees p1 linked; every
+    // later read sees the task re-linked to p2, so the atomic claim's fence
+    // refuses and the lost-claim path must report the conflict.
+    let taskReads = 0;
+    const db = Object.create(realDb) as Store;
+    db.get = (async (o: string, kind: string, id: string) => {
+      const value = await realDb.get<Record<string, unknown>>(o, kind, id);
+      if (kind === "tasks" && id === "task-relink" && value) {
+        taskReads++;
+        return { ...value, actionId: taskReads === 1 ? "p1" : "p2" };
+      }
+      return value;
+    }) as Store["get"];
+    let calls = 0;
+    const service = new ActionService(db, {
+      connected: async () => true,
+      execute: async () => {
+        calls++;
+        return "sent";
+      },
+    });
+    await realDb.put(owner, "actions", {
+      id: "p1",
+      status: "awaiting_review",
+      taskId: "task-relink",
+      hash: "h1",
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    });
+    await realDb.put(owner, "tasks", {
+      id: "task-relink",
+      status: "waiting_approval",
+      actionId: "p2",
+    });
+    await assert.rejects(
+      service.decide(owner, "p1", "h1", "approve"),
+      /no longer the task's current proposal/i,
+    );
+    assert.equal(calls, 0);
+    const saved = await realDb.get<ActionProposal>(owner, "actions", "p1");
+    assert.equal(saved?.status, "awaiting_review");
+  } finally {
+    await realDb.close();
+  }
+});

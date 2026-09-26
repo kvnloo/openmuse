@@ -288,3 +288,32 @@ test("cancelling a task still surfaces a non-conflict cleanup failure", async (t
     await db.close();
   }
 });
+test("a fresh user answer is not swallowed by a pending review", async () => {
+  const db = await createStore();
+  try {
+    const { AgentService } = await import("../apps/server/src/engine/service.ts");
+    const agent = new AgentService(
+      db,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+    await db.put("owner", "actions", { id: "p1", status: "awaiting_review" });
+    await db.put("owner", "tasks", {
+      ...task("answer-task"),
+      kind: "finance",
+      status: "queued",
+      actionId: "p1",
+      input: { csv: "date,description,amount,category\n2026-09-01,Coffee,3.50,Food" },
+      state: { answer: "count the coffee separately" },
+    });
+    await agent.worker.tick();
+    const saved = await db.get<AgentTask>("owner", "tasks", "answer-task");
+    assert.equal(saved?.status, "succeeded");
+  } finally {
+    await db.close();
+  }
+});

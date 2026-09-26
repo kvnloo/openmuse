@@ -116,12 +116,18 @@ export class ActionService {
       return proposal;
     }
     if (decision === "approve" && proposal.taskId) {
-      const task = await this.db.get<{ status: string }>(owner, "tasks", proposal.taskId);
+      const task = await this.db.get<{ status: string; actionId?: string | null }>(
+        owner,
+        "tasks",
+        proposal.taskId,
+      );
       if (!task || !["running", "waiting_approval"].includes(task.status))
         throw new AppError(
           "Resume the task before approving this action. Cancelled tasks cannot execute.",
           409,
         );
+      if (task.actionId && task.actionId !== id)
+        throw new AppError("This review is no longer the task's current proposal.", 409);
     }
     if (Date.parse(proposal.expiresAt) <= this.now()) {
       const expired = await this.db.compareAndSwap<ActionProposal>(
@@ -169,12 +175,20 @@ export class ActionService {
       // these may be reported as a successful decision.
       this.rejectLostDecision(current, decision);
       if (decision === "approve" && current.status === "awaiting_review" && proposal.taskId) {
-        const task = await this.db.get<{ status: string }>(owner, "tasks", proposal.taskId);
+        const task = await this.db.get<{ status: string; actionId?: string | null }>(
+          owner,
+          "tasks",
+          proposal.taskId,
+        );
         if (!task || !["running", "waiting_approval"].includes(task.status))
           throw new AppError(
             "Resume the task before approving this action. Cancelled tasks cannot execute.",
             409,
           );
+        // The task re-linked to a newer proposal after the pre-check: this
+        // decision lost to the re-link and must not read as a success.
+        if (task.actionId && task.actionId !== id)
+          throw new AppError("This review is no longer the task's current proposal.", 409);
       }
       return current;
     }

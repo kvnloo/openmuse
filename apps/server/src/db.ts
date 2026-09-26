@@ -83,6 +83,7 @@ export class Store {
        AND ($4::jsonb <> '"executing"'::jsonb OR data->>'taskId' IS NULL OR EXISTS (
          SELECT 1 FROM records task WHERE task.owner=action.owner AND task.kind='tasks'
          AND task.id=action.data->>'taskId' AND task.data->>'status' IN ('running','waiting_approval')
+         AND (task.data->>'actionId' IS NULL OR task.data->>'actionId' = action.id)
        )) RETURNING data`,
       [owner, id, now, JSON.stringify(status)],
     );

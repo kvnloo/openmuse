@@ -756,7 +756,8 @@ export class AgentService {
         throw new Error(
           `Reviewed action ${action.status}: ${action.error ?? "No further action was taken"}`,
         );
-      else return { status: "waiting_approval" };
+      // A fresh answer must reach the model before any review is requested.
+      else if (task.state.answer == null) return { status: "waiting_approval" };
     }
     if (task.kind === "document") return this.document(owner, task, context);
     if (task.kind === "monitor") {
