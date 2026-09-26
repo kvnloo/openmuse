@@ -285,3 +285,30 @@ test("an expired stale review cannot overwrite a concurrently executing action",
   await approval;
   assert.equal(saved?.status, "executing");
 });
+test("deciding an already-expired proposal surfaces the expiry instead of dropping the decision", async () => {
+  let now = Date.now();
+  const service = new ActionService(db, {
+    execute: async () => "sent",
+    connected: async () => true,
+    now: () => now,
+  });
+  const proposal = await service.propose("expired-decide-user", email);
+  // Simulate the worker tick marking the proposal expired after the deadline.
+  now += 31 * 60 * 1000;
+  const marked = await db.compareAndSwap<ActionProposal>(
+    "expired-decide-user",
+    "actions",
+    proposal.id,
+    { status: "awaiting_review" },
+    { status: "expired" },
+  );
+  assert.ok(marked);
+  await assert.rejects(
+    service.decide("expired-decide-user", proposal.id, proposal.hash, "approve"),
+    /expired/i,
+  );
+  await assert.rejects(
+    service.decide("expired-decide-user", proposal.id, proposal.hash, "deny"),
+    /expired/i,
+  );
+});

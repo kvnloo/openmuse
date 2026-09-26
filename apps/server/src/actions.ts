@@ -109,6 +109,8 @@ export class ActionService {
     if (!proposal) throw new AppError("Action not found", 404);
     if (proposal.hash !== hash)
       throw new AppError("This proposal changed. Open its latest review before deciding.", 409);
+    if (proposal.status === "expired")
+      throw new AppError("This review expired. Create a fresh proposal.", 409);
     if (proposal.status !== "awaiting_review") return proposal;
     if (decision === "approve" && proposal.taskId) {
       const task = await this.db.get<{ status: string }>(owner, "tasks", proposal.taskId);
