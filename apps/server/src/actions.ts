@@ -129,6 +129,11 @@ export class ActionService {
       if (!expired) {
         const current = await this.db.get<ActionProposal>(owner, "actions", id);
         if (!current) throw new AppError("Action not found", 404);
+        // The 1s worker tick may have won the expiry race between our check
+        // and this CAS. An expired proposal is terminal: never report the
+        // decision as a silent success.
+        if (current.status === "expired")
+          throw new AppError("This review expired. Create a fresh proposal.", 409);
         return current;
       }
       throw new AppError("This review expired. Create a fresh proposal.", 409);
@@ -156,6 +161,13 @@ export class ActionService {
     if (!claimed) {
       const current = await this.db.get<ActionProposal>(owner, "actions", id);
       if (!current) throw new AppError("Action not found", 404);
+      // The claim is atomic on status+expiry: losing it means a concurrent
+      // claim won (double tap -> current carries the outcome) or the proposal
+      // expired under us between the check above and the claim -- whether or
+      // not the tick has flipped the row yet. An expired proposal is terminal:
+      // report the miss as a 409, not a silent success.
+      if (current.status === "expired" || Date.parse(current.expiresAt) <= this.now())
+        throw new AppError("This review expired. Create a fresh proposal.", 409);
       return current;
     }
     await this.record(

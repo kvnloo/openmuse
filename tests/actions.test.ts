@@ -285,3 +285,96 @@ test("an expired stale review cannot overwrite a concurrently executing action",
   await approval;
   assert.equal(saved?.status, "executing");
 });
+test("an approval that loses the claim to the tick's expiry is rejected, not silently dropped", async (t) => {
+  const now = Date.now();
+  let calls = 0;
+  const service = new ActionService(db, {
+    execute: async () => {
+      calls++;
+      return "sent";
+    },
+    connected: async () => true,
+    now: () => now,
+  });
+  const proposal = await service.propose("claim-race-user", email);
+  const realClaim = db.claim.bind(db);
+  t.mock.method(db, "claim", async (...args: Parameters<Store["claim"]>) => {
+    // Simulate the 1s worker tick winning the expiry race just before our claim:
+    // the proposal flips to expired, so the atomic claim finds nothing to take.
+    await db.compareAndSwap(
+      "claim-race-user",
+      "actions",
+      proposal.id,
+      { status: "awaiting_review" },
+      { status: "expired" },
+    );
+    return realClaim(...args);
+  });
+  await assert.rejects(
+    service.decide("claim-race-user", proposal.id, proposal.hash, "approve"),
+    /expired/i,
+  );
+  assert.equal(calls, 0);
+});
+test("a decision whose own expiry CAS loses to the tick is rejected, not silently dropped", async (t) => {
+  let now = Date.now();
+  let calls = 0;
+  const service = new ActionService(db, {
+    execute: async () => {
+      calls++;
+      return "sent";
+    },
+    connected: async () => true,
+    now: () => now,
+  });
+  const proposal = await service.propose("cas-race-user", email);
+  now += 31 * 60 * 1000;
+  const realCas = db.compareAndSwap.bind(db);
+  let flipped = false;
+  t.mock.method(db, "compareAndSwap", async (...args: Parameters<Store["compareAndSwap"]>) => {
+    if (!flipped && args[1] === "actions") {
+      flipped = true;
+      // The tick's expiry CAS wins first; ours then finds nothing to flip.
+      await realCas(
+        "cas-race-user",
+        "actions",
+        proposal.id,
+        { status: "awaiting_review" },
+        { status: "expired" },
+      );
+      return null;
+    }
+    return realCas(...args);
+  });
+  await assert.rejects(
+    service.decide("cas-race-user", proposal.id, proposal.hash, "approve"),
+    /expired/i,
+  );
+  assert.equal(calls, 0);
+});
+test("an approval that lands after expiry but before the tick flips the row is rejected", async (t) => {
+  let now = Date.now();
+  let calls = 0;
+  const service = new ActionService(db, {
+    execute: async () => {
+      calls++;
+      return "sent";
+    },
+    connected: async () => true,
+    now: () => now,
+  });
+  const proposal = await service.propose("late-claim-user", email);
+  const realClaim = db.claim.bind(db);
+  t.mock.method(db, "claim", (...args: Parameters<Store["claim"]>) => {
+    // Time passes between the read-time expiry check and the atomic claim, so
+    // the claim's own expiresAt guard rejects it while the row still reads
+    // awaiting_review (the tick has not flipped it yet).
+    now += 31 * 60 * 1000;
+    return realClaim(args[0], args[1], args[2], new Date(now).toISOString());
+  });
+  await assert.rejects(
+    service.decide("late-claim-user", proposal.id, proposal.hash, "approve"),
+    /expired/i,
+  );
+  assert.equal(calls, 0);
+});
