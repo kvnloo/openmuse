@@ -748,6 +748,28 @@ export class AgentService {
     task: AgentTask,
     context: TaskContext,
   ): Promise<Partial<AgentTask>> {
+    const outcome = await this.executeTask(owner, task, context);
+    // A decision can land after the run prepared its review but before the
+    // outcome commits: reconcile a waiting_approval outcome against the linked
+    // review's current row, or the task would park on a dead review (and notify
+    // "Ready for your review" for it) until the next tick fails it.
+    if (outcome.status === "waiting_approval" && outcome.actionId) {
+      const action = await this.db.get<ActionProposal>(owner, "actions", outcome.actionId);
+      if (!action) throw new Error("The linked review could not be found");
+      if (action.status === "denied")
+        return {
+          status: "failed" as const,
+          error: `Reviewed action denied: ${action.error ?? "No further action was taken"}`,
+        };
+      if (action.status === "expired") return { status: "queued" as const, actionId: null };
+    }
+    return outcome;
+  }
+  private async executeTask(
+    owner: string,
+    task: AgentTask,
+    context: TaskContext,
+  ): Promise<Partial<AgentTask>> {
     await context.event(
       "status",
       task.attempts === 1 ? "Started working" : "Resumed work",

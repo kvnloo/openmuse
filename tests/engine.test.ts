@@ -614,3 +614,116 @@ test("a task whose linked review was denied while waiting still fails loudly", a
     await db.close();
   }
 });
+test("a deny landing while the run finalizes fails the task instead of parking it on a dead review", async () => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      execute: async () => "sent",
+      prepare: async (_owner, input) => ({ input }),
+      connected: async () => true,
+      connection: async () => ({ id: "conn-1", account: "sam@example.com" }),
+    });
+    // Deny the review the instant it exists: models a user deny landing after
+    // prepare() but before the run's outcome commits.
+    const realPropose = actions.propose.bind(actions);
+    actions.propose = (async (owner: string, raw: unknown, key?: string, taskId?: string) => {
+      const proposal = await realPropose(owner, raw, key, taskId);
+      await actions.decide(owner, proposal.id, proposal.hash, "deny");
+      return proposal;
+    }) as typeof actions.propose;
+    const mail = {
+      id: "m1",
+      from: "sam@example.com",
+      subject: "Form",
+      body: "fill this",
+      attachments: ["ref1"],
+      threadId: "t1",
+    };
+    const agent = new AgentService(
+      db,
+      { mode: "sample" } as never,
+      {
+        connection: async () => ({ id: "conn-1", account: "sam@example.com" }),
+        snapshot: async () => ({ mail: [mail] }),
+        importAttachment: async () => ({ id: "f1", name: "form.pdf" }),
+      } as never,
+      {
+        get: async () => {
+          throw new AppError("missing", 404);
+        },
+        fill: async () => ({ id: "filled1", name: "filled.pdf" }),
+      } as never,
+      actions,
+      {} as never,
+    );
+    await db.put("deny-finalize-owner", "tasks", {
+      ...task("task1"),
+      kind: "document",
+      status: "queued",
+      state: { connectionId: "conn-1" },
+      input: { messageId: "m1", fields: { name: "Sam" } },
+    });
+    await agent.worker.tick();
+    const saved = await db.get<AgentTask>("deny-finalize-owner", "tasks", "task1");
+    assert.equal(saved?.status, "failed");
+    assert.match(saved?.error ?? "", /Reviewed action denied/);
+    // The dead link stays on the failed task so retry can clear it (chunk-21 path).
+    assert.ok(saved?.actionId);
+  } finally {
+    await db.close();
+  }
+});
+test("a run that prepared its review with no decision still parks in waiting_approval", async () => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      execute: async () => "sent",
+      prepare: async (_owner, input) => ({ input }),
+      connected: async () => true,
+      connection: async () => ({ id: "conn-1", account: "sam@example.com" }),
+    });
+    const mail = {
+      id: "m1",
+      from: "sam@example.com",
+      subject: "Form",
+      body: "fill this",
+      attachments: ["ref1"],
+      threadId: "t1",
+    };
+    const agent = new AgentService(
+      db,
+      { mode: "sample" } as never,
+      {
+        connection: async () => ({ id: "conn-1", account: "sam@example.com" }),
+        snapshot: async () => ({ mail: [mail] }),
+        importAttachment: async () => ({ id: "f1", name: "form.pdf" }),
+      } as never,
+      {
+        get: async () => {
+          throw new AppError("missing", 404);
+        },
+        fill: async () => ({ id: "filled1", name: "filled.pdf" }),
+      } as never,
+      actions,
+      {} as never,
+    );
+    await db.put("no-decision-owner", "tasks", {
+      ...task("task1"),
+      kind: "document",
+      status: "queued",
+      state: { connectionId: "conn-1" },
+      input: { messageId: "m1", fields: { name: "Sam" } },
+    });
+    await agent.worker.tick();
+    const saved = await db.get<AgentTask>("no-decision-owner", "tasks", "task1");
+    assert.equal(saved?.status, "waiting_approval");
+    const review = await db.get<ActionProposal>(
+      "no-decision-owner",
+      "actions",
+      saved?.actionId ?? "",
+    );
+    assert.equal(review?.status, "awaiting_review");
+  } finally {
+    await db.close();
+  }
+});
