@@ -31,3 +31,33 @@ test("idle Postgres client errors are logged instead of crashing the process", a
     await pool.end();
   }
 });
+
+test("countActiveTasks matches the createTask cap's list()+filter semantics", async () => {
+  const store = await createStore();
+  try {
+    const terminal = ["succeeded", "failed", "cancelled"];
+    const statuses = [
+      "queued",
+      "running",
+      "scheduled",
+      "waiting_input",
+      "waiting_approval",
+      "paused",
+      "succeeded",
+      "failed",
+      "cancelled",
+    ];
+    for (let i = 0; i < statuses.length; i++)
+      await store.put("owner", "tasks", { id: `t${i}`, status: statuses[i] });
+    // A status-less record counts as active, exactly like the old JS filter.
+    await store.put("owner", "tasks", { id: "t-none" });
+    assert.equal(await store.countActiveTasks("owner", terminal), 7);
+    // Other owners and other kinds don't leak in.
+    await store.put("other", "tasks", { id: "x", status: "queued" });
+    await store.put("owner", "goals", { id: "g", status: "queued" });
+    assert.equal(await store.countActiveTasks("owner", terminal), 7);
+    assert.equal(await store.countActiveTasks("nobody", terminal), 0);
+  } finally {
+    await store.close();
+  }
+});
