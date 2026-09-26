@@ -1028,7 +1028,11 @@ export class AgentService {
       owner,
       "monitors",
       monitor.id,
-      { status: "active" },
+      // checks is the commit version: a second observe() running from a stale
+      // snapshot (lease overlap) loses this CAS instead of clobbering the
+      // first commit's baseline. The loser throws LostLeaseError and its task
+      // is requeued for a clean retry on the next tick.
+      { status: "active", checks: monitor.checks },
       {
         checks: monitor.checks + 1,
         lastCheckedAt: date(),
