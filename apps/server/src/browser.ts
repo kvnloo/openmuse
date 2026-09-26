@@ -217,6 +217,12 @@ export class BrowserService {
     });
   }
   async imports(owner: string, id: string) {
+    // Two concurrent imports of the same download both missed the
+    // browser-downloads dedup check and imported the file twice. Serialize per
+    // session like every other mutating browser operation.
+    return this.serial(id, () => this.importsOwned(owner, id));
+  }
+  private async importsOwned(owner: string, id: string) {
     await this.get(owner, id);
     const { downloads, failures } = z
       .object({

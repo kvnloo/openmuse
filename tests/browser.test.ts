@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { mkdir, mkdtemp, rm, truncate, writeFile } from "node:fs/promises";
-import { request } from "node:http";
+import { createServer, request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -9,12 +9,15 @@ import test from "node:test";
 import { createApp } from "../apps/server/src/app.ts";
 import { Auth } from "../apps/server/src/auth.ts";
 import { BrowserService } from "../apps/server/src/browser.ts";
+import type { Config } from "../apps/server/src/config.ts";
+import { createStore } from "../apps/server/src/db.ts";
 import { Files } from "../apps/server/src/files.ts";
 import { capturePdfDownload, readDownloadFailures } from "../apps/worker/src/downloads.ts";
 import { isPublicIp, validatePublicUrl } from "../apps/worker/src/network.ts";
 import { startEgressProxy } from "../apps/worker/src/proxy.ts";
 import { createWorkerServer } from "../apps/worker/src/server.ts";
 import type { BrowserSession } from "../packages/domain/src/index.ts";
+import { createSamplePdf } from "../packages/integrations/src/pdf.ts";
 import { browserFixture } from "./helpers/browser.ts";
 
 const sessionId = "00000000-0000-4000-8000-000000000001";
@@ -529,4 +532,88 @@ test("egress proxy blocks HTTP and CONNECT traffic to local network destinations
   } finally {
     await proxy.close();
   }
+});
+
+test("concurrent browser imports of the same download import the file exactly once", async (t) => {
+  const pdf = Buffer.from(await createSamplePdf());
+  const downloadId = "00000000-0000-4000-8000-000000000010";
+  let downloadFetches = 0;
+  let release!: () => void;
+  const bothArrived = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const server = createServer(async (request, response) => {
+    if (request.url === `/sessions/${sessionId}/downloads`) {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          downloads: [
+            { id: downloadId, name: "report.pdf", size: pdf.length, mimeType: "application/pdf" },
+          ],
+          failures: [],
+        }),
+      );
+      return;
+    }
+    if (request.url === `/sessions/${sessionId}/downloads/${downloadId}`) {
+      downloadFetches += 1;
+      // Hold the first fetch until the second arrives so both importers pass the
+      // dedup check before either finishes; a lone fetch proceeds after a timeout.
+      if (downloadFetches >= 2) release();
+      else {
+        const timeout = setTimeout(release, 1500);
+        await bothArrived;
+        clearTimeout(timeout);
+      }
+      response.writeHead(200, { "content-type": "application/pdf" });
+      response.end(pdf);
+      return;
+    }
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "not found" } }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert(address && typeof address !== "string");
+  const directory = await mkdtemp(join(tmpdir(), "openmuse-browser-imports-race-"));
+  const db = await createStore();
+  const config: Config = {
+    mode: "sample",
+    port: 8787,
+    host: "127.0.0.1",
+    publicUrl: "http://localhost:8787",
+    dataDir: directory,
+    agentBackend: "sample",
+    intelligenceApiKey: "test-project-key-never-sent",
+    googleRedirectUri: "http://localhost:8787/api/google/callback",
+    allowedOrigins: [],
+    workerUrl: `http://127.0.0.1:${address.port}`,
+    workerToken: "test-worker-token-at-least-32-characters",
+  };
+  const auth = new Auth(db, config, "test-signing-key");
+  const service = new BrowserService(db, config, auth, new Files(db, config, auth));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await db.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+  await db.put("owner", "browsers", savedSession);
+  const [first, second] = await Promise.all([
+    service.imports("owner", sessionId),
+    service.imports("owner", sessionId),
+  ]);
+  assert.equal(first.files.length, 1);
+  assert.equal(second.files.length, 1);
+  assert.equal(
+    second.files[0].id,
+    first.files[0].id,
+    "both concurrent callers see the same imported file",
+  );
+  assert.equal(
+    (await db.list("owner", "files")).length,
+    1,
+    "one download imports exactly one file row",
+  );
 });
