@@ -418,3 +418,134 @@ test("a task paused during review prep gets a fresh review on resume, not the cl
     await db.close();
   }
 });
+test("resuming a task whose linked review died while paused re-proposes instead of failing", async () => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      execute: async () => "sent",
+      prepare: async (_owner, input) => ({ input }),
+      connected: async () => true,
+      connection: async () => ({ id: "conn-1", account: "sam@example.com" }),
+    });
+    const agent = new AgentService(db, {} as never, {} as never, {} as never, actions, {} as never);
+    const owner = "resume-dead-owner";
+    const input = {
+      kind: "email.send" as const,
+      data: { to: ["sam@example.com"], subject: "Visit", body: "See attached." },
+    };
+    const proposal = await actions.propose(owner, input, "task1:document-reply", "task1");
+    // The orphaned review is denied (prepare()'s checkpoint-failure cleanup, or
+    // a user deny) while the task sits paused.
+    await actions.decide(owner, proposal.id, proposal.hash, "deny");
+    await db.put(owner, "tasks", {
+      ...task("task1"),
+      status: "paused",
+      actionId: proposal.id,
+    });
+    const resumed = await agent.control(owner, "task1", "resume");
+    assert.equal(resumed.status, "queued");
+    assert.equal(resumed.actionId, null);
+    // The worker must not fail the task with "Reviewed action denied": with no
+    // linked review the agent simply continues (no model configured -> asks).
+    await agent.worker.tick();
+    const after = await db.get<AgentTask>(owner, "tasks", "task1");
+    assert.equal(after?.status, "waiting_input");
+  } finally {
+    await db.close();
+  }
+});
+test("retrying a failed task with a dead linked review is allowed and clears the link", async () => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      execute: async () => "sent",
+      connected: async () => true,
+    });
+    const agent = new AgentService(db, {} as never, {} as never, {} as never, actions, {} as never);
+    const owner = "retry-dead-owner";
+    const proposal = await actions.propose(owner, {
+      kind: "email.send" as const,
+      data: { to: ["sam@example.com"], subject: "Visit", body: "See attached." },
+    });
+    // The review expired while the task was away; the outcome is certain
+    // (nothing executed), so retry must be allowed.
+    await db.put(owner, "actions", {
+      ...proposal,
+      status: "expired",
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    await db.put(owner, "tasks", {
+      ...task("task1"),
+      status: "failed",
+      error: "Reviewed action expired: no decision was made in time",
+      actionId: proposal.id,
+    });
+    const retried = await agent.control(owner, "task1", "retry");
+    assert.equal(retried.status, "queued");
+    assert.equal(retried.actionId, null);
+    await agent.worker.tick();
+    const after = await db.get<AgentTask>(owner, "tasks", "task1");
+    assert.equal(after?.status, "waiting_input");
+  } finally {
+    await db.close();
+  }
+});
+test("retry still refuses when the linked review outcome is uncertain", async () => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      execute: async () => "sent",
+      connected: async () => true,
+    });
+    const agent = new AgentService(db, {} as never, {} as never, {} as never, actions, {} as never);
+    const owner = "retry-uncertain-owner";
+    const proposal = await actions.propose(owner, {
+      kind: "email.send" as const,
+      data: { to: ["sam@example.com"], subject: "Visit", body: "See attached." },
+    });
+    await db.put(owner, "actions", { ...proposal, status: "outcome_unknown" });
+    await db.put(owner, "tasks", {
+      ...task("task1"),
+      status: "failed",
+      error: "boom",
+      actionId: proposal.id,
+    });
+    await assert.rejects(agent.control(owner, "task1", "retry"), /uncertain/);
+  } finally {
+    await db.close();
+  }
+});
+test("retry with a succeeded linked review keeps the receipt replay path", async () => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      execute: async () => "sent",
+      connected: async () => true,
+    });
+    const agent = new AgentService(db, {} as never, {} as never, {} as never, actions, {} as never);
+    const owner = "retry-receipt-owner";
+    const proposal = await actions.propose(owner, {
+      kind: "email.send" as const,
+      data: { to: ["sam@example.com"], subject: "Visit", body: "See attached." },
+    });
+    await db.put(owner, "actions", { ...proposal, status: "succeeded", result: "sent" });
+    await db.put(owner, "tasks", {
+      ...task("task1"),
+      status: "failed",
+      error: "crashed after the review completed",
+      actionId: proposal.id,
+    });
+    const retried = await agent.control(owner, "task1", "retry");
+    assert.equal(retried.status, "waiting_approval");
+    assert.equal(retried.actionId, proposal.id);
+    await agent.worker.tick();
+    // The receipt is consumed into state and the agent run continues (no
+    // model configured here, so it asks for input); the link is cleared.
+    const after = await db.get<AgentTask>(owner, "tasks", "task1");
+    assert.equal(after?.status, "waiting_input");
+    assert.equal(after?.actionId, null);
+    assert.equal((after?.state as Record<string, unknown> | undefined)?.approvalResult, "sent");
+  } finally {
+    await db.close();
+  }
+});

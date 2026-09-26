@@ -33,7 +33,7 @@ interface Options {
 // the task was paused. Other terminal states (succeeded/failed/outcome_unknown)
 // are receipts that idempotent replay must preserve.
 const deadReviewStatuses = new Set(["denied", "expired"]);
-function isDeadReview(proposal: ActionProposal, now: number): boolean {
+export function isDeadReview(proposal: ActionProposal, now: number): boolean {
   if (deadReviewStatuses.has(proposal.status)) return true;
   return proposal.status === "awaiting_review" && Date.parse(proposal.expiresAt) <= now;
 }

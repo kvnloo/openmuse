@@ -24,6 +24,7 @@ import type {
   ProposalInput,
 } from "../../../../packages/domain/src/index.ts";
 import type { ActionService } from "../actions.ts";
+import { isDeadReview } from "../actions.ts";
 import type { BrowserService } from "../browser.ts";
 import { ComputerService } from "../computer.ts";
 import type { Config } from "../config.ts";
@@ -245,24 +246,35 @@ export class AgentService {
           : task.actionId
             ? "waiting_approval"
             : "queued";
-    if (action === "retry" && task.actionId) {
+    // A retry or resume whose linked review is dead (denied/expired, or
+    // time-expired while the task was away) must not keep pointing at it:
+    // the worker would fail the task with a "Reviewed action denied/expired"
+    // the user never saw, and retry would refuse outright. The outcome is
+    // certain (nothing executed), so clear the link and let the task
+    // re-propose a fresh review. Uncertain outcomes (executing,
+    // outcome_unknown, or a still-live review) keep the existing guards.
+    let linkedDead = false;
+    if ((action === "retry" || action === "resume") && task.actionId) {
       const a = await this.db.get<ActionProposal>(owner, "actions", task.actionId);
-      if (a && a.status !== "succeeded")
+      if (!a || a.status === "failed" || isDeadReview(a, Date.now())) linkedDead = true;
+      else if (action === "retry" && a.status !== "succeeded")
         throw new AppError(
           "Check the reviewed action before retrying; its outcome may be uncertain. Start a new task when reconciled.",
           409,
         );
     }
+    const resolvedStatus = linkedDead ? "queued" : status;
     const updated = await this.db.compareAndSwap<AgentTask>(
       owner,
       "tasks",
       id,
       { status: task.status, leaseId: task.leaseId ?? null },
       {
-        status,
+        status: resolvedStatus,
         leaseId: null,
         leaseUntil: null,
         error: null,
+        ...(linkedDead ? { actionId: null } : {}),
         updatedAt: date(),
         result:
           action === "cancel"
@@ -306,7 +318,7 @@ export class AgentService {
       taskId: id,
       kind: "status",
       date: date(),
-      title: `Task ${status}`,
+      title: `Task ${resolvedStatus}`,
       detail: "Changed by you",
     });
     return updated;
