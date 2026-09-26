@@ -549,3 +549,68 @@ test("retry with a succeeded linked review keeps the receipt replay path", async
     await db.close();
   }
 });
+test("a task whose linked review expired while waiting re-proposes instead of failing", async () => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      execute: async () => "sent",
+      connected: async () => true,
+    });
+    const agent = new AgentService(db, {} as never, {} as never, {} as never, actions, {} as never);
+    const owner = "tick-expired-owner";
+    const proposal = await actions.propose(owner, {
+      kind: "email.send" as const,
+      data: { to: ["sam@example.com"], subject: "Visit", body: "See attached." },
+    });
+    // The review time-expired while the task waited for the user's decision.
+    await db.put(owner, "actions", {
+      ...proposal,
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    await db.put(owner, "tasks", {
+      ...task("task1"),
+      status: "waiting_approval",
+      actionId: proposal.id,
+    });
+    await agent.worker.tick();
+    // The tick flips the review to expired and re-runs the task; the run must
+    // clear the dead link and continue (no model configured here, so it asks
+    // for input) instead of failing with "Reviewed action expired".
+    assert.equal((await db.get(owner, "actions", proposal.id))?.status, "expired");
+    const after = await db.get<AgentTask>(owner, "tasks", "task1");
+    assert.equal(after?.status, "waiting_input");
+    assert.equal(after?.actionId, null);
+    assert.equal(after?.error ?? null, null);
+  } finally {
+    await db.close();
+  }
+});
+test("a task whose linked review was denied while waiting still fails loudly", async () => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      execute: async () => "sent",
+      connected: async () => true,
+    });
+    const agent = new AgentService(db, {} as never, {} as never, {} as never, actions, {} as never);
+    const owner = "tick-denied-owner";
+    const proposal = await actions.propose(owner, {
+      kind: "email.send" as const,
+      data: { to: ["sam@example.com"], subject: "Visit", body: "See attached." },
+    });
+    await db.put(owner, "actions", { ...proposal, status: "denied" });
+    await db.put(owner, "tasks", {
+      ...task("task1"),
+      status: "waiting_approval",
+      actionId: proposal.id,
+    });
+    await agent.worker.tick();
+    // An explicit denial is a user decision: the task must keep failing with
+    // "Reviewed action denied", never silently re-proposing.
+    const after = await db.get<AgentTask>(owner, "tasks", "task1");
+    assert.equal(after?.status, "failed");
+    assert.match(after?.error ?? "", /Reviewed action denied/);
+  } finally {
+    await db.close();
+  }
+});

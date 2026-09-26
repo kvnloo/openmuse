@@ -764,6 +764,13 @@ export class AgentService {
           state: { ...task.state, approvalResult: action.result },
           actionId: null,
         });
+      } else if (action.status === "expired") {
+        // The tick flips a linked review to expired when a waiting task's
+        // review times out; the user made no decision, so failing the task
+        // would punish slowness. Clear the link and let the run continue so
+        // it re-proposes a fresh review (the idempotent slot treats the
+        // expired row as a miss).
+        task = await context.checkpoint({ actionId: null });
       } else if (action.status !== "awaiting_review" && action.status !== "executing")
         throw new Error(
           `Reviewed action ${action.status}: ${action.error ?? "No further action was taken"}`,
