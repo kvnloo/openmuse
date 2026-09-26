@@ -611,3 +611,81 @@ test("a check keeps the baseline from a run that finishes during the request", a
   assert.equal(task?.status, "queued");
   assert.equal(task?.state.lastHash, afterRun);
 });
+
+test("a failed observe from a stale snapshot does not clobber a newer successful baseline", async () => {
+  await read("/sample-page", { text: "No tables available" });
+  const monitor = await createMonitor("Stale failure");
+  await server.agent.worker.tick();
+  const base = await db.get<Monitor>(owner, "monitors", monitor.id);
+  assert.equal(base?.checks, 1);
+
+  // A concurrent observe() succeeds from the same snapshot first.
+  const won = await db.compareAndSwap(
+    owner,
+    "monitors",
+    monitor.id,
+    { status: "active", checks: 1 },
+    {
+      checks: 2,
+      error: null,
+      lastHash: "newer-baseline",
+      nextCheckAt: new Date(Date.now() + 60000).toISOString(),
+    },
+  );
+  assert.ok(won);
+
+  await makeDue(monitor.taskId);
+  // This run still sees the pre-success snapshot, then the page fails.
+  const originalGet = db.get.bind(db);
+  db.get = (async (o: string, kind: string, id: string) => {
+    if (kind === "monitors" && id === monitor.id) return base;
+    return originalGet(o, kind, id);
+  }) as Store["get"];
+  const restorePage = failPage();
+  try {
+    await server.agent.worker.tick();
+  } finally {
+    restorePage();
+    db.get = originalGet;
+  }
+  // The stale failure was dropped and the task requeued instead of committing
+  // a stale error over the newer baseline.
+  assert.equal((await db.get<AgentTask>(owner, "tasks", monitor.taskId))?.status, "queued");
+  const current = await db.get<Monitor>(owner, "monitors", monitor.id);
+  assert.equal(current?.checks, 2);
+  assert.equal(current?.error, null);
+});
+
+test("a failed observe against a paused monitor requeues instead of scheduling a retry", async () => {
+  await read("/sample-page", { text: "No tables available" });
+  const monitor = await createMonitor("Paused failure");
+  await server.agent.worker.tick();
+  const base = await db.get<Monitor>(owner, "monitors", monitor.id);
+  assert.ok(base);
+  // The user pauses the watch after this run's snapshot was taken.
+  await db.put(owner, "monitors", { ...base, status: "paused" });
+
+  await makeDue(monitor.taskId);
+  const originalGet = db.get.bind(db);
+  db.get = (async (o: string, kind: string, id: string) => {
+    if (kind === "monitors" && id === monitor.id) return base;
+    return originalGet(o, kind, id);
+  }) as Store["get"];
+  const restorePage = failPage();
+  try {
+    await server.agent.worker.tick();
+  } finally {
+    restorePage();
+    db.get = originalGet;
+  }
+  // The stale failure was dropped: no retry scheduled, no failure notice, and
+  // no error re-armed on the paused watch.
+  assert.equal((await db.get<AgentTask>(owner, "tasks", monitor.taskId))?.status, "queued");
+  const current = await db.get<Monitor>(owner, "monitors", monitor.id);
+  assert.equal(current?.status, "paused");
+  assert.equal(current?.error, null);
+  const notices = (await read<AgentNotification[]>("/notifications")).filter(
+    (item) => item.taskId === monitor.taskId,
+  );
+  assert.equal(notices.length, 0);
+});

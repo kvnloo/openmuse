@@ -747,46 +747,7 @@ export class AgentService {
       else return { status: "waiting_approval" };
     }
     if (task.kind === "document") return this.document(owner, task, context);
-    if (task.kind === "monitor") {
-      try {
-        return await this.observe(owner, task, context);
-      } catch (error) {
-        if (error instanceof LostLeaseError || context.signal.aborted) throw error;
-        await context.guard();
-        const failures = Number(task.state.failures ?? 0) + 1;
-        const detail = error instanceof Error ? error.message : "Page check failed";
-        const nextCheckAt = new Date(
-          Date.now() + Math.min(60, 2 ** failures) * 60000,
-        ).toISOString();
-        await this.db.compareAndSwap(
-          owner,
-          "monitors",
-          String(task.input.monitorId),
-          { status: "active" },
-          { error: detail, nextCheckAt },
-        );
-        await context.event(
-          "error",
-          failures >= 5 ? "Watch paused after repeated failures" : "Check failed; retry scheduled",
-          detail,
-        );
-        return {
-          status: failures >= 5 ? "paused" : "scheduled",
-          error: detail,
-          nextRunAt: nextCheckAt,
-          state: {
-            ...task.state,
-            failures,
-            resumingMonitor: false,
-            notice: {
-              title: "Watch needs attention",
-              body: detail,
-              key: `watch-error:${task.id}:${failures >= 5 ? "paused" : "retry"}`,
-            },
-          },
-        };
-      }
-    }
+    if (task.kind === "monitor") return await this.observe(owner, task, context);
     if (task.kind === "finance") {
       await context.event("step", "Analyzing the imported transactions");
       const csv = z.string().parse(task.input.csv);
@@ -992,95 +953,136 @@ export class AgentService {
     if (!monitor) throw new Error("Monitor not found");
     if (monitor.status !== "active")
       return { status: monitor.status === "paused" ? "paused" : "cancelled" };
-    let observation: { url: string; title: string; text: string; sessionId?: string };
-    if (monitor.url === "sample://availability") {
-      if (this.config.mode !== "sample") throw new Error("Sample source unavailable");
-      const page = await this.db.get<{ text: string }>(owner, "sample-pages", "availability");
-      observation = {
-        url: monitor.url,
-        title: "Sample dinner availability",
-        text: page?.text ?? "No tables available. Check again later.",
-      };
-    } else {
+    try {
+      let observation: { url: string; title: string; text: string; sessionId?: string };
+      if (monitor.url === "sample://availability") {
+        if (this.config.mode !== "sample") throw new Error("Sample source unavailable");
+        const page = await this.db.get<{ text: string }>(owner, "sample-pages", "availability");
+        observation = {
+          url: monitor.url,
+          title: "Sample dinner availability",
+          text: page?.text ?? "No tables available. Check again later.",
+        };
+      } else {
+        await ctx.guard();
+        observation = await this.browser.observe(
+          owner,
+          monitor.url,
+          typeof task.state.sessionId === "string" ? task.state.sessionId : undefined,
+        );
+      }
+      const text = observation.text.replace(/\s+/g, " ").trim();
+      const currentHash = hash(text);
+      const previousHash =
+        typeof task.state.lastHash === "string" ? task.state.lastHash : monitor.lastHash;
+      const matched =
+        monitor.condition === "change"
+          ? Boolean(previousHash && previousHash !== currentHash)
+          : monitor.condition === "contains"
+            ? text.toLowerCase().includes(monitor.value.toLowerCase())
+            : this.matchesPrice(text, Number(monitor.value));
+      const previouslyMatched = Boolean(task.state.matched);
+      const shouldNotify = matched && (monitor.condition === "change" || !previouslyMatched);
+      const nextCheckAt = new Date(Date.now() + monitor.intervalMinutes * 60000).toISOString();
       await ctx.guard();
-      observation = await this.browser.observe(
+      // Worker lease is checked before each publication; monitor control also invalidates that lease.
+      const savedMonitor = await this.db.compareAndSwap(
         owner,
-        monitor.url,
-        typeof task.state.sessionId === "string" ? task.state.sessionId : undefined,
-      );
-    }
-    const text = observation.text.replace(/\s+/g, " ").trim();
-    const currentHash = hash(text);
-    const previousHash =
-      typeof task.state.lastHash === "string" ? task.state.lastHash : monitor.lastHash;
-    const matched =
-      monitor.condition === "change"
-        ? Boolean(previousHash && previousHash !== currentHash)
-        : monitor.condition === "contains"
-          ? text.toLowerCase().includes(monitor.value.toLowerCase())
-          : this.matchesPrice(text, Number(monitor.value));
-    const previouslyMatched = Boolean(task.state.matched);
-    const shouldNotify = matched && (monitor.condition === "change" || !previouslyMatched);
-    const nextCheckAt = new Date(Date.now() + monitor.intervalMinutes * 60000).toISOString();
-    await ctx.guard();
-    // Worker lease is checked before each publication; monitor control also invalidates that lease.
-    const savedMonitor = await this.db.compareAndSwap(
-      owner,
-      "monitors",
-      monitor.id,
-      { status: "active" },
-      {
-        checks: monitor.checks + 1,
-        lastCheckedAt: date(),
-        lastHash: currentHash,
-        lastValue: text.slice(0, 1000),
-        nextCheckAt,
-        error: null,
-      },
-    );
-    if (!savedMonitor) throw new LostLeaseError();
-    await ctx.event(
-      "observation",
-      previousHash ? "Checked for changes" : "Saved the first observation",
-      text.slice(0, 1000),
-    );
-    if (shouldNotify) {
-      await ctx.guard();
-      await ctx.event("result", "A meaningful change was found", text.slice(0, 500));
-    }
-    return {
-      status: "scheduled",
-      nextRunAt: nextCheckAt,
-      result: shouldNotify
-        ? "Change found. A notification is ready."
-        : "Watching. I'll check again on schedule.",
-      state: {
-        ...task.state,
-        sessionId: observation.sessionId,
-        lastHash: currentHash,
-        resumingMonitor: false,
-        matched,
-        failures: 0,
-        notice: shouldNotify
-          ? {
-              title: monitor.title,
-              body: `Condition met at ${observation.url}: ${text.slice(0, 240)}`,
-              key: `monitor:${monitor.id}:${currentHash}`,
-            }
-          : null,
-      },
-      error: null,
-      evidence: [
+        "monitors",
+        monitor.id,
+        { status: "active" },
         {
-          id: monitor.id,
-          kind: "web",
-          title: observation.title,
-          url: observation.url,
-          excerpt: text.slice(0, 600),
+          checks: monitor.checks + 1,
+          lastCheckedAt: date(),
+          lastHash: currentHash,
+          lastValue: text.slice(0, 1000),
+          nextCheckAt,
+          error: null,
         },
-      ],
-      plan: task.plan.map((s) => ({ ...s, status: "succeeded" })),
-    };
+      );
+      if (!savedMonitor) throw new LostLeaseError();
+      await ctx.event(
+        "observation",
+        previousHash ? "Checked for changes" : "Saved the first observation",
+        text.slice(0, 1000),
+      );
+      if (shouldNotify) {
+        await ctx.guard();
+        await ctx.event("result", "A meaningful change was found", text.slice(0, 500));
+      }
+      return {
+        status: "scheduled",
+        nextRunAt: nextCheckAt,
+        result: shouldNotify
+          ? "Change found. A notification is ready."
+          : "Watching. I'll check again on schedule.",
+        state: {
+          ...task.state,
+          sessionId: observation.sessionId,
+          lastHash: currentHash,
+          resumingMonitor: false,
+          matched,
+          failures: 0,
+          notice: shouldNotify
+            ? {
+                title: monitor.title,
+                body: `Condition met at ${observation.url}: ${text.slice(0, 240)}`,
+                key: `monitor:${monitor.id}:${currentHash}`,
+              }
+            : null,
+        },
+        error: null,
+        evidence: [
+          {
+            id: monitor.id,
+            kind: "web",
+            title: observation.title,
+            url: observation.url,
+            excerpt: text.slice(0, 600),
+          },
+        ],
+        plan: task.plan.map((s) => ({ ...s, status: "succeeded" })),
+      };
+    } catch (error) {
+      if (error instanceof LostLeaseError || ctx.signal.aborted) throw error;
+      await ctx.guard();
+      const failures = Number(task.state.failures ?? 0) + 1;
+      const detail = error instanceof Error ? error.message : "Page check failed";
+      const nextCheckAt = new Date(Date.now() + Math.min(60, 2 ** failures) * 60000).toISOString();
+      // The checks counter versions the observation baseline: a concurrent
+      // success commit or a pause/stop after this run's snapshot means this
+      // failure report is stale. Committing it anyway would clobber the newer
+      // baseline with a stale error and backoff schedule, or re-arm an error
+      // on a paused watch. The stale loser requeues like any other lease loss.
+      const committed = await this.db.compareAndSwap(
+        owner,
+        "monitors",
+        String(task.input.monitorId),
+        { status: "active", checks: monitor.checks },
+        { error: detail, nextCheckAt },
+      );
+      if (!committed) throw new LostLeaseError();
+      await ctx.event(
+        "error",
+        failures >= 5 ? "Watch paused after repeated failures" : "Check failed; retry scheduled",
+        detail,
+      );
+      return {
+        status: failures >= 5 ? "paused" : "scheduled",
+        error: detail,
+        nextRunAt: nextCheckAt,
+        state: {
+          ...task.state,
+          failures,
+          resumingMonitor: false,
+          notice: {
+            title: "Watch needs attention",
+            body: detail,
+            key: `watch-error:${task.id}:${failures >= 5 ? "paused" : "retry"}`,
+          },
+        },
+      };
+    }
   }
   private matchesPrice(text: string, threshold: number) {
     const matches = [...text.matchAll(/(?:\$|USD\s*)(\d+(?:,\d{3})*(?:\.\d{1,2})?)/g)];
