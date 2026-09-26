@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { ActionService } from "../apps/server/src/actions.ts";
 import { createStore } from "../apps/server/src/db.ts";
 import { analyzeSpending } from "../apps/server/src/engine/finance.ts";
+import { draftReviewKey } from "../apps/server/src/engine/model.ts";
 import { AgentService } from "../apps/server/src/engine/service.ts";
 import { TaskWorker } from "../apps/server/src/engine/worker.ts";
 import { AppError } from "../apps/server/src/errors.ts";
@@ -884,6 +885,57 @@ test("a resumed watch's next failure notifies instead of being swallowed by the 
       "expected a fresh cycle-1 retry notification",
     );
     assert.equal(notes.filter((n) => n.taskId === "task1").length, 2);
+  } finally {
+    await db.close();
+  }
+});
+test("draft review keys are scoped to the task", () => {
+  const data = {
+    to: ["sam@example.com"],
+    subject: "Visit",
+    body: "See attached.",
+    cc: [],
+    bcc: [],
+    attachmentIds: [],
+  };
+  assert.notEqual(draftReviewKey("task-a", data), draftReviewKey("task-b", data));
+  assert.equal(draftReviewKey("task-a", data), draftReviewKey("task-a", data));
+});
+test("identical drafts from two tasks mint independent reviews", async () => {
+  const db = await createStore();
+  try {
+    const actions = new ActionService(db, {
+      execute: async () => "sent",
+      connected: async () => true,
+    });
+    const data = {
+      to: ["sam@example.com"],
+      subject: "Visit",
+      body: "See attached.",
+      cc: [],
+      bcc: [],
+      attachmentIds: [],
+    };
+    const input = { kind: "email.send" as const, data };
+    const a = await actions.propose("owner", input, draftReviewKey("task-a", data), "task-a");
+    const b = await actions.propose("owner", input, draftReviewKey("task-b", data), "task-b");
+    assert.notEqual(a.id, b.id);
+    assert.equal(a.taskId, "task-a");
+    assert.equal(b.taskId, "task-b");
+    // Cancelling task-a must not brick task-b's approval: the approve fence
+    // checks the review's own task, not the task that first minted the slot.
+    await db.put("owner", "tasks", {
+      ...task("task-a"),
+      status: "cancelled" as AgentTask["status"],
+      actionId: a.id,
+    });
+    await db.put("owner", "tasks", {
+      ...task("task-b"),
+      status: "waiting_approval" as AgentTask["status"],
+      actionId: b.id,
+    });
+    const decided = await actions.decide("owner", b.id, b.hash, "approve");
+    assert.equal(decided.status, "succeeded");
   } finally {
     await db.close();
   }

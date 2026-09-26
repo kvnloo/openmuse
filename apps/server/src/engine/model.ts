@@ -10,6 +10,17 @@ import type { AgentService } from "./service.ts";
 import { tanstackAgent } from "./tanstack-agent.ts";
 import type { TaskContext } from "./worker.ts";
 
+// Review idempotency keys must be scoped to the task: two tasks drafting the
+// same content must not share one review row. A shared row binds taskId to the
+// first task, so the approve fence checks the wrong task's status and the
+// second task's review can become unapprovable (e.g. after the first task is
+// cancelled) until the review expires.
+export function draftReviewKey(taskId: string, data: unknown): string {
+  return createHash("sha256")
+    .update(`${taskId}:${JSON.stringify(data)}`)
+    .digest("hex");
+}
+
 export async function executeModelTask(
   service: AgentService,
   owner: string,
@@ -219,7 +230,7 @@ export async function executeModelTask(
       "Prepare the exact email for a separate user review",
       emailDraftSchema,
       async (data) => {
-        const key = createHash("sha256").update(JSON.stringify(data)).digest("hex");
+        const key = draftReviewKey(task.id, data);
         const action = await service.prepare(owner, task, { kind: "email.send", data }, key, ctx);
         outcome = { status: "waiting_approval", actionId: action.id };
         return { status: "waiting_approval", actionId: action.id };
@@ -230,7 +241,7 @@ export async function executeModelTask(
       "Prepare an event for a separate user review",
       eventDraftSchema,
       async (data) => {
-        const key = createHash("sha256").update(JSON.stringify(data)).digest("hex");
+        const key = draftReviewKey(task.id, data);
         const action = await service.prepare(
           owner,
           task,
