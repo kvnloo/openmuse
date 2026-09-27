@@ -217,39 +217,44 @@ export class BrowserService {
     });
   }
   async imports(owner: string, id: string) {
-    await this.get(owner, id);
-    const { downloads, failures } = z
-      .object({
-        downloads: z.array(
-          z.object({ id: z.string(), name: z.string(), size: z.number(), mimeType: z.string() }),
-        ),
-        failures: z.array(failureSchema),
-      })
-      .parse(await (await this.request(`/sessions/${id}/downloads`)).json());
-    const saved = [];
-    for (const download of downloads) {
-      const existing = await this.db.get<{ fileId: string }>(
-        owner,
-        "browser-downloads",
-        download.id,
-      );
-      if (existing) {
-        saved.push(this.files.signed(owner, await this.files.get(owner, existing.fileId)));
-        continue;
+    // Serialized per session: the browser-downloads dedup check below is a
+    // check-then-act, so two concurrent imports would both miss the row and
+    // import the same download twice (duplicate file rows, orphaned bytes).
+    return this.serial(id, async () => {
+      await this.get(owner, id);
+      const { downloads, failures } = z
+        .object({
+          downloads: z.array(
+            z.object({ id: z.string(), name: z.string(), size: z.number(), mimeType: z.string() }),
+          ),
+          failures: z.array(failureSchema),
+        })
+        .parse(await (await this.request(`/sessions/${id}/downloads`)).json());
+      const saved = [];
+      for (const download of downloads) {
+        const existing = await this.db.get<{ fileId: string }>(
+          owner,
+          "browser-downloads",
+          download.id,
+        );
+        if (existing) {
+          saved.push(this.files.signed(owner, await this.files.get(owner, existing.fileId)));
+          continue;
+        }
+        const response = await this.request(
+          `/sessions/${id}/downloads/${encodeURIComponent(download.id)}`,
+        );
+        const file = await this.files.import(
+          owner,
+          download.name,
+          new Uint8Array(await response.arrayBuffer()),
+          `Browser · ${id}`,
+        );
+        await this.db.put(owner, "browser-downloads", { id: download.id, fileId: file.id });
+        saved.push(file);
       }
-      const response = await this.request(
-        `/sessions/${id}/downloads/${encodeURIComponent(download.id)}`,
-      );
-      const file = await this.files.import(
-        owner,
-        download.name,
-        new Uint8Array(await response.arrayBuffer()),
-        `Browser · ${id}`,
-      );
-      await this.db.put(owner, "browser-downloads", { id: download.id, fileId: file.id });
-      saved.push(file);
-    }
-    return { files: saved, failures };
+      return { files: saved, failures };
+    });
   }
   console(owner: string, id: string) {
     return browserConsole(this.auth.sign(owner, `/api/browsers/${id}/preview`));
