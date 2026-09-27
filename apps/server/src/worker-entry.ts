@@ -8,6 +8,10 @@ if (!config.databaseUrl)
     "A separate task worker requires DATABASE_URL. Embedded PGlite runs inside the API process.",
   );
 const db = await createStore({ databaseUrl: config.databaseUrl });
+// The standalone worker boots without the API, so it must run the same
+// interrupted-action recovery as index.ts: a crash during action execution
+// leaves the review in "executing", which is undecidable and re-parked forever.
+await db.recoverInterruptedActions();
 const { agent } = await createApp(db, config);
 agent.start();
 console.log("OpenMuse task worker running");
