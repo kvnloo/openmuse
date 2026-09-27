@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   ActionProposal,
   ActivityEntry,
@@ -438,6 +438,10 @@ export class WorkspaceService {
       decodeURIComponent(filename),
       await this.google(owner, connection.id).getAttachment(messageId, attachmentId),
       `Gmail · ${message.subject}`,
+      undefined,
+      // Same attachment bytes for the same connection, so a retry between the
+      // import and the imports-record write below lands on the same file row.
+      createHash("sha256").update(`attachment:${connection.id}:${reference}`).digest("hex"),
     );
     await this.db.put(owner, "imports", {
       id: reference,

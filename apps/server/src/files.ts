@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Artifact } from "../../../packages/domain/src/index.ts";
@@ -20,11 +20,13 @@ export class Files {
     bytes: Uint8Array,
     source: string,
     parentId?: string,
+    // Callers with a content-derived id pass it so a retried import lands on the
+    // same row instead of minting a duplicate file.
+    id: string = randomUUID(),
   ): Promise<Artifact> {
     if (bytes.length > 10 * 1024 * 1024) throw new AppError("PDFs must be 10 MB or smaller", 413);
     const metadata = await inspectPdf(bytes);
     if (metadata.pageCount > 500) throw new AppError("PDFs must have 500 pages or fewer", 422);
-    const id = randomUUID();
     const safeName = Array.from(name.split(/[\\/]/).at(-1) ?? "document.pdf")
       .filter((character) => character.charCodeAt(0) >= 32 && character.charCodeAt(0) !== 127)
       .join("")
@@ -43,7 +45,12 @@ export class Files {
     };
     const directory = join(this.config.dataDir, "files");
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    await writeFile(join(directory, `${id}.pdf`), bytes, { mode: 0o600, flag: "wx" });
+    try {
+      await writeFile(join(directory, `${id}.pdf`), bytes, { mode: 0o600, flag: "wx" });
+    } catch (error) {
+      // A retried import reuses the deterministic id for identical bytes; the first write wins.
+      if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
+    }
     await this.db.put(owner, "files", artifact);
     return this.signed(owner, artifact);
   }
@@ -66,12 +73,15 @@ export class Files {
     const file = await this.get(owner, id);
     const bytes = await this.bytes(owner, id);
     const output = await fillPdf(bytes, values);
-    return this.import(
-      owner,
-      `${file.name.replace(/\.pdf$/i, "")} — filled.pdf`,
-      output,
-      `Filled from ${file.name}`,
-      id,
-    );
+    // The filled bytes are a pure function of the source, the field values and the
+    // output name, so the id is content-derived: a lease-loss retry of fill_pdf
+    // reuses it instead of minting a duplicate filled copy.
+    const name = `${file.name.replace(/\.pdf$/i, "")} — filled.pdf`;
+    const canonical = Object.entries(values)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([field, value]) => `${field}:${JSON.stringify(value)}`)
+      .join(",");
+    const fillId = createHash("sha256").update(`fill:${id}:${canonical}:${name}`).digest("hex");
+    return this.import(owner, name, output, `Filled from ${file.name}`, id, fillId);
   }
 }
