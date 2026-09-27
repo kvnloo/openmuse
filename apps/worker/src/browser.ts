@@ -299,7 +299,10 @@ export async function createBrowserManager(options: {
     read: (id: string) =>
       serial(id, async () => {
         const { page } = active(id);
-        await validatePublicUrl(page.url());
+        // A blocked redirect parks the page on about:blank (see navigate); it
+        // carries no content, so it reads back like any other blank state.
+        const current = page.url();
+        if (current !== "about:blank") await validatePublicUrl(current);
         // Evaluation is fixed by the worker; callers cannot inject JavaScript.
         const result = await page.evaluate(() => {
           const text = document.body?.innerText ?? "";
@@ -310,7 +313,7 @@ export async function createBrowserManager(options: {
             truncated: text.length > 100_000,
           };
         });
-        await validatePublicUrl(result.url);
+        if (result.url !== "about:blank") await validatePublicUrl(result.url);
         const session: Session = {
           id,
           url: result.url,
