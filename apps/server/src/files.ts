@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Artifact } from "../../../packages/domain/src/index.ts";
@@ -20,11 +20,15 @@ export class Files {
     bytes: Uint8Array,
     source: string,
     parentId?: string,
+    id: string = randomUUID(),
   ): Promise<Artifact> {
     if (bytes.length > 10 * 1024 * 1024) throw new AppError("PDFs must be 10 MB or smaller", 413);
     const metadata = await inspectPdf(bytes);
     if (metadata.pageCount > 500) throw new AppError("PDFs must have 500 pages or fewer", 422);
-    const id = randomUUID();
+    const existing = await this.db.get<Artifact>(owner, "files", id);
+    // A retry of the same deterministic id returns the stored artifact instead of
+    // minting a duplicate row (and a second copy of the bytes on disk).
+    if (existing) return this.signed(owner, existing);
     const safeName = Array.from(name.split(/[\\/]/).at(-1) ?? "document.pdf")
       .filter((character) => character.charCodeAt(0) >= 32 && character.charCodeAt(0) !== 127)
       .join("")
@@ -64,6 +68,11 @@ export class Files {
   }
   async fill(owner: string, id: string, values: Record<string, string | boolean>) {
     const file = await this.get(owner, id);
+    // Deterministic id: an identical fill is the same artifact, so a retried tool
+    // call (or a crash between the fill and the task checkpoint) cannot mint
+    // duplicate rows and orphaned bytes. import() returns the stored row for a
+    // repeat of the same id.
+    const digest = createHash("sha256").update(JSON.stringify(values)).digest("hex");
     const bytes = await this.bytes(owner, id);
     const output = await fillPdf(bytes, values);
     return this.import(
@@ -72,6 +81,7 @@ export class Files {
       output,
       `Filled from ${file.name}`,
       id,
+      `filled:${file.id}:${digest}`,
     );
   }
 }
