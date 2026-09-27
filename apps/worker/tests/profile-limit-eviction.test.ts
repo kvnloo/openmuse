@@ -59,48 +59,46 @@ async function resolveIp(hostname: string): Promise<string> {
   return answer.data;
 }
 
-test(
-  "real Chromium evicts the least-recently-used closed profile instead of failing at the profile limit",
-  { timeout: 120_000 },
-  async () => {
-    const dataDir = await mkdtemp(join(tmpdir(), "openmuse-browser-profile-limit-"));
-    // Seed 20 closed profiles on disk, exactly as closed sessions persist and
-    // rehydrate on worker startup. Distinct updatedAt values make the eviction
-    // target deterministic: seed 0 is the oldest.
-    const seedIds: string[] = [];
-    for (let i = 0; i < 20; i++) {
-      const id = randomUUID();
-      seedIds.push(id);
-      await mkdir(join(dataDir, id), { recursive: true });
-      await writeFile(
-        join(dataDir, id, "session.json"),
-        JSON.stringify({
-          id,
-          title: `seed-${i}`,
-          url: "https://example.com/",
-          status: "active",
-          updatedAt: `2026-01-${String(i + 1).padStart(2, "0")}T00:00:00.000Z`,
-        }),
-      );
-    }
-    const browser = await createBrowserManager({ dataDir });
+test("real Chromium evicts the least-recently-used closed profile instead of failing at the profile limit", {
+  timeout: 120_000,
+}, async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "openmuse-browser-profile-limit-"));
+  // Seed 20 closed profiles on disk, exactly as closed sessions persist and
+  // rehydrate on worker startup. Distinct updatedAt values make the eviction
+  // target deterministic: seed 0 is the oldest.
+  const seedIds: string[] = [];
+  for (let i = 0; i < 20; i++) {
     const id = randomUUID();
-    try {
-      assert.equal(browser.list().length, 20);
-      const ip = await resolveIp("httpbin.org");
-      // On base this rejects with PROFILE_LIMIT: the limit has no eviction
-      // path, so 20 closed profiles block every new session permanently.
-      const session = await browser.create(id, `http://${ip}/`);
-      assert.equal(session.status, "active");
-      const remaining = await readdir(dataDir);
-      assert.equal(remaining.length, 20, "one profile evicted, one created");
-      assert.ok(!remaining.includes(seedIds[0]), "oldest closed profile evicted");
-      for (const kept of seedIds.slice(1)) assert.ok(remaining.includes(kept));
-      assert.ok(remaining.includes(id));
-      assert.equal(browser.list().length, 20);
-    } finally {
-      await browser.close().catch(() => {});
-      await rm(dataDir, { recursive: true, force: true });
-    }
-  },
-);
+    seedIds.push(id);
+    await mkdir(join(dataDir, id), { recursive: true });
+    await writeFile(
+      join(dataDir, id, "session.json"),
+      JSON.stringify({
+        id,
+        title: `seed-${i}`,
+        url: "https://example.com/",
+        status: "active",
+        updatedAt: `2026-01-${String(i + 1).padStart(2, "0")}T00:00:00.000Z`,
+      }),
+    );
+  }
+  const browser = await createBrowserManager({ dataDir });
+  const id = randomUUID();
+  try {
+    assert.equal(browser.list().length, 20);
+    const ip = await resolveIp("httpbin.org");
+    // On base this rejects with PROFILE_LIMIT: the limit has no eviction
+    // path, so 20 closed profiles block every new session permanently.
+    const session = await browser.create(id, `http://${ip}/`);
+    assert.equal(session.status, "active");
+    const remaining = await readdir(dataDir);
+    assert.equal(remaining.length, 20, "one profile evicted, one created");
+    assert.ok(!remaining.includes(seedIds[0]), "oldest closed profile evicted");
+    for (const kept of seedIds.slice(1)) assert.ok(remaining.includes(kept));
+    assert.ok(remaining.includes(id));
+    assert.equal(browser.list().length, 20);
+  } finally {
+    await browser.close().catch(() => {});
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
