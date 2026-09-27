@@ -158,12 +158,22 @@ export async function createBrowserManager(options: {
         `Close an active session before opening another (limit ${maxSessions}).`,
         409,
       );
-    if (!sessions.has(id) && sessions.size >= 20)
-      throw new WorkerError(
-        "PROFILE_LIMIT",
-        "The worker has reached its 20 saved-profile limit.",
-        409,
-      );
+    if (!sessions.has(id) && sessions.size >= 20) {
+      // Closed profiles persist on disk and rehydrate on startup, so a hard
+      // limit with no eviction becomes permanent after 20 sessions. Evict the
+      // least-recently-used closed profile instead of failing new sessions.
+      const evictable = [...sessions.values()]
+        .filter((session) => !running.has(session.id))
+        .sort((a, b) => (a.updatedAt < b.updatedAt ? -1 : 1))[0];
+      if (!evictable)
+        throw new WorkerError(
+          "PROFILE_LIMIT",
+          "The worker has reached its 20 saved-profile limit.",
+          409,
+        );
+      await rm(directory(evictable.id), { recursive: true, force: true });
+      sessions.delete(evictable.id);
+    }
     const previous = sessions.get(id);
     const profileDir = join(directory(id), "profile");
     const tempDirectory = join("/tmp", `openmuse-downloads-${id}`);
