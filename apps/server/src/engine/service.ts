@@ -708,7 +708,10 @@ export class AgentService {
     try {
       await context.checkpoint({ actionId: proposal.id });
     } catch (error) {
-      if (proposal.status === "awaiting_review")
+      // A lost lease hands the task to another worker, whose retry re-proposes the
+      // same key and must still find this proposal awaiting review. Only deny when
+      // the task itself was aborted (pause/cancel), where no legitimate retry follows.
+      if (proposal.status === "awaiting_review" && context.signal.aborted)
         await this.actions.decide(owner, proposal.id, proposal.hash, "deny");
       throw error;
     }
