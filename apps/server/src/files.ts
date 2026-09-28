@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Artifact } from "../../../packages/domain/src/index.ts";
@@ -7,6 +7,16 @@ import type { Auth } from "./auth.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
+
+/** Content-derived id for computer workspace PDF exports: a retried export of
+ * identical bytes lands on the same file row instead of duplicating it, while
+ * genuinely changed content still mints a new row. */
+export function computerExportId(path: string, bytes: Uint8Array): string {
+  const content = createHash("sha256").update(bytes).digest("hex");
+  return createHash("sha256")
+    .update(JSON.stringify(["computer-export", path, content]))
+    .digest("hex");
+}
 
 export class Files {
   constructor(
@@ -20,17 +30,18 @@ export class Files {
     bytes: Uint8Array,
     source: string,
     parentId?: string,
+    id?: string,
   ): Promise<Artifact> {
     if (bytes.length > 10 * 1024 * 1024) throw new AppError("PDFs must be 10 MB or smaller", 413);
     const metadata = await inspectPdf(bytes);
     if (metadata.pageCount > 500) throw new AppError("PDFs must have 500 pages or fewer", 422);
-    const id = randomUUID();
+    const fileId = id ?? randomUUID();
     const safeName = Array.from(name.split(/[\\/]/).at(-1) ?? "document.pdf")
       .filter((character) => character.charCodeAt(0) >= 32 && character.charCodeAt(0) !== 127)
       .join("")
       .slice(0, 180);
     const artifact: Artifact = {
-      id,
+      id: fileId,
       name: safeName,
       mimeType: "application/pdf",
       size: bytes.length,
@@ -43,7 +54,23 @@ export class Files {
     };
     const directory = join(this.config.dataDir, "files");
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    await writeFile(join(directory, `${id}.pdf`), bytes, { mode: 0o600, flag: "wx" });
+    const filePath = join(directory, `${fileId}.pdf`);
+    try {
+      await writeFile(filePath, bytes, { mode: 0o600, flag: "wx" });
+    } catch (error) {
+      // A concurrent or retried import with the same explicit id lands here.
+      // Identical bytes mean the first write won: reuse its row. Differing
+      // bytes under one id is a caller bug, so fail loud instead of aliasing.
+      if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
+      const onDisk = await readFile(filePath);
+      if (!onDisk.equals(Buffer.from(bytes))) {
+        throw new AppError("Conflicting upload for the same file id", 500);
+      }
+      const existing = await this.db.get<Artifact>(owner, "files", fileId);
+      if (existing) return this.signed(owner, existing);
+      // The disk write landed but the row never did (crash between the two):
+      // fall through and heal the row below.
+    }
     await this.db.put(owner, "files", artifact);
     return this.signed(owner, artifact);
   }

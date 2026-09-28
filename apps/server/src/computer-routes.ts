@@ -7,6 +7,7 @@ import {
   computerWriteSchema,
 } from "./computer.ts";
 import type { Files } from "./files.ts";
+import { computerExportId } from "./files.ts";
 
 export function computerRoutes(computer: ComputerService, files: Files) {
   const app = new Hono<{ Variables: { owner: string } }>();
@@ -44,7 +45,19 @@ export function computerRoutes(computer: ComputerService, files: Files) {
   app.post("/files/export", async (c) => {
     const { path } = computerPathSchema.parse(await c.req.json());
     const { name, bytes } = await computer.pdfBytes(c.get("owner"), path);
-    return c.json(await files.import(c.get("owner"), name, bytes, `Computer: ${path}`), 201);
+    // Content-derived id: a double-submit with identical bytes returns the
+    // same file instead of creating a duplicate row.
+    return c.json(
+      await files.import(
+        c.get("owner"),
+        name,
+        bytes,
+        `Computer: ${path}`,
+        undefined,
+        computerExportId(path, bytes),
+      ),
+      201,
+    );
   });
   return app;
 }
