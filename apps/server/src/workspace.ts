@@ -427,6 +427,12 @@ export class WorkspaceService {
     );
     if (cached && cached.connectionId === connection.id)
       return this.files.signed(owner, await this.files.get(owner, cached.artifactId));
+    // The reference may already be an imported artifact: sample-mode seeds carry
+    // artifact ids, and live-mode cacheMail rewrites imported refs to artifact
+    // ids on later snapshots. File ids never contain colons, so this cannot
+    // collide with a messageId:attachmentId:filename reference.
+    const existing = await this.db.get<Artifact>(owner, "files", reference);
+    if (existing) return this.files.signed(owner, existing);
     const [messageId, attachmentId, filename] = reference.split(":");
     if (!messageId || !attachmentId || !filename)
       throw new AppError("Attachment reference is invalid");
