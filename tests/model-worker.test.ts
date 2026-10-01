@@ -294,7 +294,6 @@ test("browser reads keep observation identity distinct while reusing one session
   assert.equal(new Set(webEvidence.map((item) => item.id)).size, 2);
 });
 
-
 test("aborting delegated read_web stops before page read and requeues the task", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "openmuse-model-browser-abort-"));
   const db = await createStore();
