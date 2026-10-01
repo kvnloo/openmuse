@@ -356,7 +356,7 @@ test("aborting delegated read_web stops before page read and requeues the task",
 
     const settled = await server.agent.getTask("owner", task.id);
     assert.equal(settled.status, "queued", settled.error ?? settled.result);
-    assert.equal(settled.error, null);
+    assert.equal(settled.error, undefined);
     assert.deepEqual(browserCalls, ["/sessions"]);
   } finally {
     await server.agent.stop();
